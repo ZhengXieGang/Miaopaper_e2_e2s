@@ -28,6 +28,7 @@
 #include <sys/time.h>
 
 #include "esp_log.h"
+#include "esp_newlib.h"
 #include "sdkconfig.h"
 #ifdef CONFIG_PM_ENABLE
 #include "esp_pm.h"
@@ -78,6 +79,8 @@ _Static_assert(MP_TITLE_MAX == MP_BLE_TITLE_MAX, "title length drifted");
 #define MP_TIME_DEFAULT_UNIX 1767225600u
 #define MP_TIME_DEFAULT_YEAR 2026
 #define MP_TIME_DEFAULT_WEEK 4       /* 2026-01-01 = 周四（1=周一 … 7=周日） */
+#define MP_TIME_MIN_VALID_UNIX 946684800u   /* 2000-01-01 00:00:00 */
+#define MP_TIME_MAX_VALID_UNIX 4102444800u  /* 2100-01-01 00:00:00 */
 
 /* 进度落盘节流：mp_app.h 已给 MP_POS_FLUSH_MS。 */
 
@@ -267,6 +270,13 @@ static void __attribute__((noreturn)) enter_ext1_deep_sleep(uint64_t wake_mask)
         (void)rtc_gpio_pullup_en(BOARD_KEY_OK_GPIO);
     }
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+#if SOC_PM_SUPPORT_RTC_SLOW_MEM_PD
+    (void)esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_ON);
+#endif
+#if SOC_PM_SUPPORT_XTAL32K_PD
+    /* 深睡期间显式保持 32.768 kHz 外部晶振不断电，确保跨深睡走时不减速 */
+    (void)esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL32K, ESP_PD_OPTION_ON);
+#endif
     (void)esp_sleep_enable_ext1_wakeup_io(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_deep_sleep_start();
 }
@@ -1205,11 +1215,80 @@ static void close_book(void)
     mp_app_state.book_len = 0;
 }
 
+static uint32_t days_from_civil(uint16_t y, uint8_t m, uint8_t d);
+static void civil_from_days(uint32_t days, uint16_t *year, uint8_t *month,
+                            uint8_t *day);
+
+/* 读取硬件 POSIX RTC 当前墙钟（秒 + 毫秒），范围外视为未就绪。 */
+static bool wall_time_get(uint32_t *unix_s, uint32_t *msec)
+{
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) != 0) {
+        return false;
+    }
+    if (tv.tv_sec < (time_t)MP_TIME_MIN_VALID_UNIX ||
+        tv.tv_sec >= (time_t)MP_TIME_MAX_VALID_UNIX) {
+        return false;
+    }
+    if (unix_s) {
+        *unix_s = (uint32_t)tv.tv_sec;
+    }
+    if (msec) {
+        long us = tv.tv_usec;
+        if (us < 0) {
+            us = 0;
+        } else if (us >= 1000000L) {
+            us = 999999L;
+        }
+        *msec = (uint32_t)(us / 1000L);
+    }
+    return true;
+}
+
+/* 按 Unix 秒更新年月日星期与时分显示字段，有变化返回 1。 */
+static uint8_t wall_time_sync_fields(uint32_t ux)
+{
+    uint32_t days = ux / 86400u;
+    uint16_t y = MP_TIME_DEFAULT_YEAR;
+    uint8_t m = 1;
+    uint8_t d = 1;
+    civil_from_days(days, &y, &m, &d);
+
+    uint8_t week = (uint8_t)((days + 3u) % 7u + 1u);
+    uint8_t h = (uint8_t)((ux / 3600u) % 24u);
+    uint8_t mi = (uint8_t)((ux / 60u) % 60u);
+    uint8_t changed = 0;
+
+    if (s_year != y || mp_app_state.month != m || mp_app_state.day != d ||
+        mp_app_state.week != week || mp_app_state.hour != h ||
+        mp_app_state.min != mi) {
+        s_year = y;
+        mp_app_state.month = m;
+        mp_app_state.day = d;
+        mp_app_state.week = week;
+        mp_app_state.hour = h;
+        mp_app_state.min = mi;
+        changed = 1;
+    }
+    s_day_index = days;
+    return changed;
+}
+
+/* 从硬件 RTC 立即拉取最新墙钟到状态字段，供切回时钟/解锁渲染前使用。 */
+static void wall_time_refresh_now(void)
+{
+    uint32_t ux = 0;
+    if (wall_time_get(&ux, NULL)) {
+        (void)wall_time_sync_fields(ux);
+    }
+}
+
 static void open_clock(uint8_t force_full)
 {
     if (mp_app_state.book_open) {
         close_book();
     }
+    wall_time_refresh_now();
     go_screen(MP_SCREEN_CLOCK, force_full);
 }
 
@@ -1733,6 +1812,7 @@ static void unlock(uint32_t now)
             scene_commit(1);          /* 回阅读并全刷当前页（§2.4） */
         }
     } else {
+        wall_time_refresh_now();
         mp_app_state.screen = MP_SCREEN_CLOCK;
         scene_commit(0);
     }
@@ -3182,9 +3262,10 @@ static void apply_time(uint32_t unix_s, uint16_t year, uint8_t month, uint8_t da
     mp_app_state.min = (uint8_t)((unix_s / 60u) % 60u);
     s_day_index = unix_s / 86400u;
 
-    /* 同步写入系统 RTC，保证跨深睡继续走时。 */
+    /* 同步写入系统 RTC 并立即锚定硬件计数器，保证跨轻/深睡连续走时。 */
     struct timeval tv = {.tv_sec = (time_t)unix_s, .tv_usec = 0};
     (void)settimeofday(&tv, NULL);
+    esp_sync_timekeeping_timers();
     s_rtc.magic = MP_RTC_MAGIC;
     s_rtc.time_synced = 1;
 
@@ -3420,37 +3501,14 @@ static void take_pending_time(uint32_t now)
 
 static void time_update(uint32_t now)
 {
-    uint32_t elapsed_s;
-    uint32_t t;
-    uint8_t changed = 0;
-
-    if (now < mp_app_state.time_base_ms) {
-        mp_app_state.time_base_ms = now;
-    }
-    elapsed_s = (now - mp_app_state.time_base_ms) / 1000u;
-    t = mp_app_state.time_base_unix + elapsed_s;
-
-    uint8_t h = (uint8_t)((t / 3600u) % 24u);
-    uint8_t mi = (uint8_t)((t / 60u) % 60u);
-    if (h != mp_app_state.hour || mi != mp_app_state.min) {
-        mp_app_state.hour = h;
-        mp_app_state.min = mi;
-        changed = 1;
+    uint32_t t = 0;
+    if (!wall_time_get(&t, NULL)) {
+        /* 仅当 POSIX RTC 异常未就绪时才用单调毫秒差分兜底（无符号差防回绕）。 */
+        uint32_t elapsed_s = (uint32_t)(now - mp_app_state.time_base_ms) / 1000u;
+        t = mp_app_state.time_base_unix + elapsed_s;
     }
 
-    uint32_t day = t / 86400u;
-    while (s_day_index < day) {
-        s_day_index++;
-        if (++mp_app_state.day > days_in_month(mp_app_state.month, s_year)) {
-            mp_app_state.day = 1;
-            if (++mp_app_state.month > 12) {
-                mp_app_state.month = 1;
-                s_year++;
-            }
-        }
-        mp_app_state.week = (uint8_t)(mp_app_state.week % 7u + 1u);
-        changed = 1;
-    }
+    uint8_t changed = wall_time_sync_fields(t);
 
     /* 分钟变化只重绘时钟页（M §7.4）：阅读时不去打扰，锁屏/DEBUG/上传也不画。 */
     if (changed && mp_app_state.screen == MP_SCREEN_CLOCK &&
@@ -3489,6 +3547,9 @@ static void __attribute__((noreturn)) low_batt_shutdown(void)
     storage_unmount();
     sleep_hold_power_pins();
     vTaskDelay(pdMS_TO_TICKS(1000));
+
+    /* 进深睡前把当前高精度时间锚定进 RTC 计时器，保证深睡不断走时。 */
+    esp_sync_timekeeping_timers();
 
     enter_ext1_deep_sleep((1ULL << BOARD_CHARGE_DET_GPIO) |
                           (1ULL << BOARD_KEY_OK_GPIO));
@@ -3611,6 +3672,9 @@ static void __attribute__((noreturn)) lock_deep_sleep_enter(void)
         wait += 20u;
     }
     vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* 进深睡前同步活跃期高精度时钟到硬件 RTC，消除唤醒跨小时/跨天走时偏移。 */
+    esp_sync_timekeeping_timers();
 
     ESP_LOGI(TAG, "enter lock deep sleep");
     enter_ext1_deep_sleep(1ULL << BOARD_KEY_OK_GPIO);
@@ -3788,27 +3852,21 @@ void mp_app_boot(void)
     s_day_index = MP_TIME_DEFAULT_UNIX / 86400u;
 
     /* 若本周期内曾同步过时间，从跨深睡的 POSIX RTC 恢复最新走时基准。 */
-    if (s_rtc.magic == MP_RTC_MAGIC && s_rtc.time_synced) {
-        struct timeval tv;
-        if (gettimeofday(&tv, NULL) == 0 &&
-            tv.tv_sec >= (time_t)MP_TIME_DEFAULT_UNIX &&
-            tv.tv_sec < (time_t)4102444800LL) {
-            uint32_t ux = (uint32_t)tv.tv_sec;
-            uint32_t days = ux / 86400u;
-            uint16_t y = MP_TIME_DEFAULT_YEAR;
-            uint8_t m = 1;
-            uint8_t d = 1;
-            civil_from_days(days, &y, &m, &d);
-            mp_app_state.time_base_unix = ux;
-            mp_app_state.time_base_ms = boot_now;
-            mp_app_state.hour = (uint8_t)((ux / 3600u) % 24u);
-            mp_app_state.min = (uint8_t)((ux / 60u) % 60u);
-            mp_app_state.day = d;
-            mp_app_state.month = m;
-            mp_app_state.week = (uint8_t)((days + 3u) % 7u + 1u);
-            s_year = y;
-            s_day_index = days;
-        }
+    uint32_t ux = 0;
+    uint32_t ms = 0;
+    if (s_rtc.magic == MP_RTC_MAGIC && s_rtc.time_synced &&
+        wall_time_get(&ux, &ms)) {
+        (void)wall_time_sync_fields(ux);
+        mp_app_state.time_base_unix = ux;
+        /* 保留亚秒毫秒偏移，避免深睡唤醒后整分钟边沿漂移。 */
+        mp_app_state.time_base_ms = (boot_now >= ms) ? (boot_now - ms) : 0u;
+    } else {
+        /* 冷启动时也立即初始化系统 RTC，防止未手动对时前进入深睡归零停走。 */
+        struct timeval tv = {.tv_sec = (time_t)MP_TIME_DEFAULT_UNIX, .tv_usec = 0};
+        (void)settimeofday(&tv, NULL);
+        esp_sync_timekeeping_timers();
+        s_rtc.magic = MP_RTC_MAGIC;
+        s_rtc.time_synced = 1;
     }
 
     /* 存储：main.c 已按 §10.2 调过 storage_init()/mp_store_init()；这里再确认一次
@@ -3947,11 +4005,18 @@ static uint32_t app_next_wait_ms(uint32_t now)
     }
     if (mp_app_state.screen == MP_SCREEN_CLOCK && !mp_app_state.uploading &&
         !mp_app_state.debug_mode) {
-        uint32_t elapsed_ms = (uint32_t)(now - mp_app_state.time_base_ms);
-        uint32_t sec_mod =
-            (mp_app_state.time_base_unix + elapsed_ms / 1000u) % 60u;
-        uint32_t sub_ms = elapsed_ms % 1000u;
-        uint32_t rem_ms = (60u - sec_mod) * 1000u - sub_ms + 20u;
+        uint32_t ux = 0;
+        uint32_t ms = 0;
+        uint32_t rem_ms;
+        if (wall_time_get(&ux, &ms)) {
+            rem_ms = (60u - (ux % 60u)) * 1000u - ms + 25u;
+        } else {
+            uint32_t elapsed_ms = (uint32_t)(now - mp_app_state.time_base_ms);
+            uint32_t sec_mod =
+                (mp_app_state.time_base_unix + elapsed_ms / 1000u) % 60u;
+            uint32_t sub_ms = elapsed_ms % 1000u;
+            rem_ms = (60u - sec_mod) * 1000u - sub_ms + 20u;
+        }
         if (rem_ms < wait) {
             wait = rem_ms;
         }
