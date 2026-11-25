@@ -31,9 +31,9 @@ const sim_book_t *sim_store_books(size_t *count);
  * returned value is the logical row count (4). */
 uint8_t sim_store_fill_rows(mp_ui_row_t rows[MP_LIST_ROWS], uint8_t scroll);
 
-/* SETTINGS window: E2S 8 rows (存储 is an info row), E2 7 rows (无背光), 4-row window. */
-#define SIM_SETTINGS_ROWS 8
-#define SIM_SETTINGS_E2_ROWS 7
+/* SETTINGS window: E2S 7 rows, E2 6 rows (无背光), 4-row window. */
+#define SIM_SETTINGS_ROWS 7
+#define SIM_SETTINGS_E2_ROWS 6
 uint8_t sim_settings_fill_rows(mp_ui_row_t rows[MP_LIST_ROWS], uint8_t scroll);
 uint8_t sim_settings_e2_fill_rows(mp_ui_row_t rows[MP_LIST_ROWS], uint8_t scroll);
 

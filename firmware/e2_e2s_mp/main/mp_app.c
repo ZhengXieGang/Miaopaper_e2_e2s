@@ -572,18 +572,7 @@ static void view_read(mp_ui_state_t *v)
     v->percent = pct;
 }
 
-/* 存储行：只填 s_buf_space（值），总量/已用百分比单独返回。 */
-static uint8_t storage_bar_pct(void)
-{
-    uint64_t total = 0;
-    uint64_t freeb = 0;
-    if (store_space(&total, &freeb) != 0 || total == 0) {
-        return 0;
-    }
-    uint64_t used = total > freeb ? total - freeb : 0;
-    return (uint8_t)((used * 100u + total / 2u) / total);
-}
-
+/* 生成关于页使用的存储空间文本（MiB，十分位四舍五入，避免浮点运算）。 */
 static void build_space_line(void)
 {
     uint64_t total = 0;
@@ -595,47 +584,43 @@ static void build_space_line(void)
         return;
     }
 
-    /* COPY_DECK §3.4：GB = 1000^3，十等分四舍五入，避免浮点。 */
-    const uint64_t gb = 1000000000ull;
+    const uint64_t mb = 1024ull * 1024ull;
     uint64_t used = total > freeb ? total - freeb : 0;
-    uint64_t used_t = (used * 10u + gb / 2u) / gb;
-    uint64_t total_t = (total * 10u + gb / 2u) / gb;
-    snprintf(s_buf_space, sizeof(s_buf_space), "%u.%u/%u.%uGB",
+    uint64_t used_t = (used * 10u + mb / 2u) / mb;
+    uint64_t total_t = (total * 10u + mb / 2u) / mb;
+    snprintf(s_buf_space, sizeof(s_buf_space), "%u.%u/%u.%uMB",
              (unsigned)(used_t / 10u), (unsigned)(used_t % 10u),
              (unsigned)(total_t / 10u), (unsigned)(total_t % 10u));
 }
 
-/* 设置页项定义与动态顺序表：有背光 8 行（存储下标 5），无背光 7 行（存储下标 4）。 */
+/* 设置页项定义与动态顺序表：有背光 7 行，无背光 6 行。 */
 typedef enum {
     SET_ITEM_BLE = 0,
     SET_ITEM_SLEEP,
     SET_ITEM_LOCK_DISP,
     SET_ITEM_BACKLIGHT,
     SET_ITEM_TIME,
-    SET_ITEM_STORAGE,
     SET_ITEM_ABOUT,
     SET_ITEM_RESTORE,
 } set_item_t;
 
-/* 有背光（E2S）：8 行，存储行在下标 5（不可选中）。 */
+/* 有背光（E2S）：7 行。 */
 static const uint8_t k_set_items_bl[] = {
     SET_ITEM_BLE,
     SET_ITEM_SLEEP,
     SET_ITEM_LOCK_DISP,
     SET_ITEM_BACKLIGHT,
     SET_ITEM_TIME,
-    SET_ITEM_STORAGE,
     SET_ITEM_ABOUT,
     SET_ITEM_RESTORE,
 };
 
-/* 无背光（E2）：7 行，隐藏背光项，存储行在下标 4（不可选中）。 */
+/* 无背光（E2）：6 行，隐藏背光项。 */
 static const uint8_t k_set_items_nobl[] = {
     SET_ITEM_BLE,
     SET_ITEM_SLEEP,
     SET_ITEM_LOCK_DISP,
     SET_ITEM_TIME,
-    SET_ITEM_STORAGE,
     SET_ITEM_ABOUT,
     SET_ITEM_RESTORE,
 };
@@ -664,7 +649,6 @@ static void settings_fill(mp_ui_state_t *v, const uint8_t *items, uint8_t count)
     if (si >= MP_SLEEP_TIMEOUT_COUNT) {
         si = MP_SLEEP_IDX_DEFAULT;
     }
-    build_space_line();
 
     for (uint8_t i = 0; i < MP_LIST_ROWS; i++) {
         uint8_t idx = (uint8_t)(v->scroll + i);
@@ -716,12 +700,6 @@ static void settings_fill(mp_ui_state_t *v, const uint8_t *items, uint8_t count)
             r->label = "时间设置";
             r->kind = MP_ROW_ACTION;
             break;
-        case SET_ITEM_STORAGE:
-            r->label = "存储";
-            r->kind = MP_ROW_STORAGE;
-            r->value = s_buf_space;
-            r->bar = storage_bar_pct();
-            break;
         case SET_ITEM_ABOUT:
             r->label = "关于";
             r->kind = MP_ROW_ACTION;
@@ -746,7 +724,7 @@ static void view_settings(mp_ui_state_t *v)
     uint8_t count = 0;
     const uint8_t *items = settings_items(&count);
     uint8_t sel = mp_app_state.set_sel;
-    if (sel >= count || items[sel] == SET_ITEM_STORAGE) {
+    if (sel >= count) {
         sel = 0;
     }
     v->row_count = count;
@@ -761,14 +739,16 @@ static void view_about(mp_ui_state_t *v)
     v->left.enc = MP_STR_UTF8;
     v->mid = NULL;
 
+    /* 每次渲染关于页时刷新存储占用（MB）到第 4 行规格表 */
+    build_space_line();
+
     snprintf(s_buf_about[0], sizeof(s_buf_about[0]), "%s",
              mp_app_state.has_backlight ? "Miaopaper E2S" : "Miaopaper E2");
     snprintf(s_buf_about[1], sizeof(s_buf_about[1]), "固件 %u.%u.%u",
              (unsigned)READER_VERSION_MAJOR, (unsigned)READER_VERSION_MINOR,
              (unsigned)READER_VERSION_PATCH);
     snprintf(s_buf_about[2], sizeof(s_buf_about[2]), "构建 %s", MP_BUILD_DATE);
-    snprintf(s_buf_about[3], sizeof(s_buf_about[3]), "%s",
-             text_hz16_glyph(0xB0, 0xA1) ? "字库 内置" : "字库 缺失");
+    snprintf(s_buf_about[3], sizeof(s_buf_about[3]), "存储 %s", s_buf_space);
     v->about_lines = 4;
 
     for (uint8_t i = 0; i < MP_LIST_ROWS; i++) {
@@ -2011,18 +1991,12 @@ static void bl_popup_cancel(void)
 static void settings_step(int dir)
 {
     uint8_t count = 0;
-    const uint8_t *items = settings_items(&count);
+    (void)settings_items(&count);
     uint8_t sel = mp_app_state.set_sel;
     if (sel >= count) {
         sel = 0;
     }
-    for (uint8_t tries = 0; tries < count; tries++) {
-        sel = (uint8_t)(((int)sel + dir + (int)count) % (int)count);
-        if (items[sel] != SET_ITEM_STORAGE) {
-            break;
-        }
-    }
-    mp_app_state.set_sel = sel;
+    mp_app_state.set_sel = (uint8_t)(((int)sel + dir + (int)count) % (int)count);
 }
 
 static void settings_activate(void)

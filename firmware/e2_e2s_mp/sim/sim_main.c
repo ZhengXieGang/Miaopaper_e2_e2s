@@ -108,7 +108,7 @@ static void fx_settings(mp_ui_state_t *st, uint8_t sel)
 }
 
 static void fx_settings_sel0(mp_ui_state_t *st) { fx_settings(st, 0); }
-static void fx_settings_sel7(mp_ui_state_t *st) { fx_settings(st, 7); }
+static void fx_settings_sel7(mp_ui_state_t *st) { fx_settings(st, SIM_SETTINGS_ROWS - 1); }
 
 static void fx_settings_e2(mp_ui_state_t *st)
 {

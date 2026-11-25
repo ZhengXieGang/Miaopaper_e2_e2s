@@ -59,7 +59,7 @@ typedef struct {
 
     /* 列表光标 */
     uint8_t sel;                    /* SELECT */
-    uint8_t set_sel;                /* SETTINGS（显示行号，跳过存储行） */
+    uint8_t set_sel;                /* SETTINGS（显示行号） */
     uint8_t info_sel;               /* BOOK_INFO 动作 0..3 */
     uint8_t jump_pct;               /* JUMP 目标百分比 0..100 */
     uint8_t time_step;              /* TIME_SET 0=年..4=分 */

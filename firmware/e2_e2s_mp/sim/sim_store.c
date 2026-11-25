@@ -20,37 +20,36 @@ static const sim_book_t k_books[SIM_STORE_BOOKS] = {
     { k_title_hongloumeng, MP_STR_GB2312, 6144u },
 };
 
-/* 8 frozen settings rows (COPY_DECK §2.4). Values are static so the view
- * model can keep pointers without copying. */
+/* 7 settings rows without storage item (moved to ABOUT). Values are static. */
 static const char *const k_settings_labels[SIM_SETTINGS_ROWS] = {
-    "蓝牙", "锁屏", "锁屏展示", "背光", "时间设置", "存储", "关于", "恢复原厂固件",
+    "蓝牙", "锁屏", "锁屏展示", "背光", "时间设置", "关于", "恢复原厂固件",
 };
 static const char *const k_settings_values[SIM_SETTINGS_ROWS] = {
-    NULL, "3分钟", "阅读数据", "2档", NULL, "3.2/7.4GB", NULL, NULL,
+    NULL, "3分钟", "阅读数据", "2档", NULL, NULL, NULL,
 };
 static const uint8_t k_settings_kind[SIM_SETTINGS_ROWS] = {
     MP_ROW_TOGGLE, MP_ROW_VALUE, MP_ROW_VALUE, MP_ROW_VALUE,
-    MP_ROW_ACTION, MP_ROW_STORAGE, MP_ROW_ACTION, MP_ROW_ACTION,
+    MP_ROW_ACTION, MP_ROW_ACTION, MP_ROW_ACTION,
 };
 
-/* 无背光设备（E2）设置页 7 行：隐藏背光项，存储位于下标 4。 */
+/* 无背光设备（E2）设置页 6 行：隐藏背光项。 */
 static const char *const k_settings_e2_labels[SIM_SETTINGS_E2_ROWS] = {
-    "蓝牙", "锁屏", "锁屏展示", "时间设置", "存储", "关于", "恢复原厂固件",
+    "蓝牙", "锁屏", "锁屏展示", "时间设置", "关于", "恢复原厂固件",
 };
 static const char *const k_settings_e2_values[SIM_SETTINGS_E2_ROWS] = {
-    NULL, "3分钟", "阅读数据", NULL, "3.2/7.4GB", NULL, NULL,
+    NULL, "3分钟", "阅读数据", NULL, NULL, NULL,
 };
 static const uint8_t k_settings_e2_kind[SIM_SETTINGS_E2_ROWS] = {
     MP_ROW_TOGGLE, MP_ROW_VALUE, MP_ROW_VALUE, MP_ROW_ACTION,
-    MP_ROW_STORAGE, MP_ROW_ACTION, MP_ROW_ACTION,
+    MP_ROW_ACTION, MP_ROW_ACTION,
 };
 
-/* ABOUT is one page now: the panel line moved out (评审：设置里不需要面板信息)。 */
+/* ABOUT is one page now: storage space moved into the 4th line in MB. */
 static const char *const k_about[MP_LIST_ROWS] = {
     "Miaopaper E2S",
     "固件 1.0.3",
     "构建 2026-11-25",
-    "字库 内置",
+    "存储 12.4/118.5MB",
 };
 
 /* 红楼梦, first page: 12 full-width chars per line = 192 px < 246. */
@@ -131,7 +130,7 @@ uint8_t sim_settings_fill_rows(mp_ui_row_t rows[MP_LIST_ROWS], uint8_t scroll)
             rows[i].kind = k_settings_kind[idx];
             rows[i].value = k_settings_values[idx];
             rows[i].on = (idx == 0) ? 1 : 0;
-            rows[i].bar = (idx == 5) ? 43 : 0;
+            rows[i].bar = 0;
         } else {
             rows[i].label = NULL;
             rows[i].enc = MP_STR_UTF8;
@@ -151,7 +150,7 @@ uint8_t sim_settings_e2_fill_rows(mp_ui_row_t rows[MP_LIST_ROWS], uint8_t scroll
             rows[i].kind = k_settings_e2_kind[idx];
             rows[i].value = k_settings_e2_values[idx];
             rows[i].on = (idx == 0) ? 1 : 0;
-            rows[i].bar = (idx == 4) ? 43 : 0;
+            rows[i].bar = 0;
         } else {
             rows[i].label = NULL;
             rows[i].enc = MP_STR_UTF8;
