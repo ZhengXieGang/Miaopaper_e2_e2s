@@ -549,8 +549,8 @@ DONE --delete--> DELETED 0x00，条目清零；compact 时转回 EMPTY 0xFF
   `mp_settings_defaults()` 仍在 RAM 中生效。
 - 统计：`stats.bin` 保存累计阅读秒数和字数。READ 屏每秒加 1 秒，
   正向翻页累加字符数。每 60 秒写一次，也随进度保存。没有清零入口。
-- 容量：`esp_vfs_fat_info("/sdcard")`，按 1000³ 换算，四舍五入到 0.1 GB。
-  失败时设置页显示 `不可用`。
+- 容量：`esp_vfs_fat_info("/sdcard")`，按 1024²（MiB）换算，四舍五入到 0.1 MB，在关于页展示。
+  失败时显示 `不可用`。
 - `mp_store` 只在 app 任务调用。所有 `/sdcard/mp` 路径共用同一把递归锁。
 
 ---

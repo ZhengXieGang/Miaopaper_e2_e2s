@@ -27,7 +27,7 @@ CJK_INDEX = 2
 
 KEEP = [
     "clock", "select", "read_cn", "settings", "settings_scroll",
-    "backlight", "backlight_popup", "book_info", "jump", "time_set",
+    "about", "backlight_popup", "book_info", "jump", "time_set",
     "lock_img", "lock_stats",
 ]
 
