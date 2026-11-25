@@ -1,0 +1,66 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+// 读取本地 Release 签名配置（若存在）
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
+android {
+    namespace 'com.zxg.miaopaperflash'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.zxg.miaopaperflash"
+        minSdk 26
+        targetSdk 34
+        versionCode 37
+        versionName "1.1"
+    }
+    signingConfigs {
+        release {
+            if (keystorePropsFile.exists()) {
+                storeFile rootProject.file(keystoreProps.getProperty('storeFile'))
+                storePassword keystoreProps.getProperty('storePassword')
+                keyAlias keystoreProps.getProperty('keyAlias')
+                keyPassword keystoreProps.getProperty('keyPassword')
+            }
+        }
+    }
+    // 不打包任何内置示例或原厂镜像，所有固件均由用户手动选择。
+    sourceSets {
+        main.assets.setSrcDirs([])
+    }
+    buildFeatures {
+        compose true
+    }
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+    lint {
+        // 避免离线或直连 Maven Central 受限时 lintVital 阻断 Release 打包。
+        checkReleaseBuilds = false
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.activity:activity-compose:1.12.4'
+    implementation 'androidx.compose.ui:ui:1.9.2'
+    implementation 'androidx.compose.foundation:foundation:1.9.2'
+    implementation 'androidx.compose.material3:material3:1.4.0'
+}
