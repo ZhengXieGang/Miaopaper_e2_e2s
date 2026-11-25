@@ -1,11 +1,9 @@
 # ============================================================
 # 白名单式 .gitignore
 #
-# 默认忽略本目录下的一切，只放行下面明确列出的关键文档与
-# 刷机 App 源码。这样可以保证：
-#   - 原厂 APK、反编译产物、固件 dump、字体/美术素材不入库
-#   - 签名密钥、本机 sdk/keystore 配置不入库
-#   - 构建产物、模拟器输出、3D 与视频素材不入库
+# 默认忽略本目录下的一切，只放行关键文档、刷机 App 与两个
+# 固件工程的源码。原厂 APK、反编译产物、flash dump、签名密钥、
+# 构建产物、模拟器输出与第三方美术素材都不入库。
 #
 # 新增要入库的文件时，必须在对应目录下补一条 ! 放行规则。
 # ============================================================
@@ -14,91 +12,105 @@
 *
 !.gitignore
 
-# 注意：Git 无法在被忽略的目录内部重新放行文件，
-# 所以下面每个要放行的文件都逐级写了父目录规则。
+# Git 不能在被忽略的目录内部重新放行文件，
+# 所以下面每个要放行的路径都逐级写了父目录规则。
 
 # ---------- 2. 仓库根 ----------
 !/.gitignore
+!/LICENSE
 !/README.md
 
-# ---------- 3. 逆向 / 固件分析文档 ----------
+# ---------- 3. 文档 ----------
 !/docs/
-!/docs/E2S_READER_INVENTORY.md
-!/docs/E2S_THIRD_PARTY_FIRMWARE.md
-!/docs/E2_VS_E2S_FIRMWARE_DIFF.md
+!/docs/*.md
+!/docs/images/
+!/docs/images/*.png
+!/docs/research/
+!/docs/research/*.md
 
-# flash dump 记录（仅文档，dump 二进制不入库）
-!/dump/
-!/dump/FLASH_DUMP_FINDINGS.md
+# ---------- 4. 刷机 App：app/E2SFlash ----------
+!/app/
+!/app/E2SFlash/
+!/app/E2SFlash/.gitignore
+!/app/E2SFlash/README.md
+!/app/E2SFlash/settings.gradle
+!/app/E2SFlash/build.gradle
+!/app/E2SFlash/gradle.properties
 
-# ---------- 4. 刷机 App：E2SFlash ----------
-!/demo/
-!/demo/E2SFlash/
-!/demo/E2SFlash/.gitignore
-!/demo/E2SFlash/README.md
-!/demo/E2SFlash/settings.gradle
-!/demo/E2SFlash/build.gradle
-!/demo/E2SFlash/gradle.properties
+!/app/E2SFlash/app/
+!/app/E2SFlash/app/build.gradle
+!/app/E2SFlash/app/proguard-rules.pro
 
-!/demo/E2SFlash/app/
-!/demo/E2SFlash/app/build.gradle
-!/demo/E2SFlash/app/proguard-rules.pro
+!/app/E2SFlash/app/src/
+!/app/E2SFlash/app/src/main/
+!/app/E2SFlash/app/src/main/AndroidManifest.xml
 
-!/demo/E2SFlash/app/src/
-!/demo/E2SFlash/app/src/main/
-!/demo/E2SFlash/app/src/main/AndroidManifest.xml
+!/app/E2SFlash/app/src/main/java/
+!/app/E2SFlash/app/src/main/java/com/
+!/app/E2SFlash/app/src/main/java/com/zxg/
+!/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/
+!/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/A5Flasher.java
+!/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/A5Protocol.java
+!/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/MainActivity.kt
 
-!/demo/E2SFlash/app/src/main/java/
-!/demo/E2SFlash/app/src/main/java/com/
-!/demo/E2SFlash/app/src/main/java/com/zxg/
-!/demo/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/
-!/demo/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/A5Flasher.java
-!/demo/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/A5Protocol.java
-!/demo/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/MainActivity.kt
+!/app/E2SFlash/app/src/main/res/
+!/app/E2SFlash/app/src/main/res/values/
+!/app/E2SFlash/app/src/main/res/values/themes.xml
+!/app/E2SFlash/app/src/main/res/values-night/
+!/app/E2SFlash/app/src/main/res/values-night/themes.xml
+!/app/E2SFlash/app/src/main/res/drawable/
+!/app/E2SFlash/app/src/main/res/drawable/ic_launcher_background.xml
+!/app/E2SFlash/app/src/main/res/drawable/ic_launcher_foreground.xml
+!/app/E2SFlash/app/src/main/res/mipmap-anydpi-v26/
+!/app/E2SFlash/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+!/app/E2SFlash/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
 
-!/demo/E2SFlash/app/src/main/res/
-!/demo/E2SFlash/app/src/main/res/values/
-!/demo/E2SFlash/app/src/main/res/values/themes.xml
-!/demo/E2SFlash/app/src/main/res/values-night/
-!/demo/E2SFlash/app/src/main/res/values-night/themes.xml
-!/demo/E2SFlash/app/src/main/res/drawable/
-!/demo/E2SFlash/app/src/main/res/drawable/ic_launcher_background.xml
-!/demo/E2SFlash/app/src/main/res/drawable/ic_launcher_foreground.xml
-!/demo/E2SFlash/app/src/main/res/mipmap-anydpi-v26/
-!/demo/E2SFlash/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
-!/demo/E2SFlash/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+# App 的签名、本地配置与构建产物
+/app/E2SFlash/keystore/
+/app/E2SFlash/keystore.properties
+/app/E2SFlash/local.properties
+/app/E2SFlash/.gradle/
+/app/E2SFlash/.kotlin/
+/app/E2SFlash/build/
+/app/E2SFlash/app/build/
+/app/E2SFlash/app/src/main/assets/
+/app/E2SFlash/app/src/main/assets-*/
 
-# 明确排除：App 的签名、本地路径与构建产物
-/demo/E2SFlash/keystore/
-/demo/E2SFlash/keystore.properties
-/demo/E2SFlash/local.properties
-/demo/E2SFlash/.gradle/
-/demo/E2SFlash/.kotlin/
-/demo/E2SFlash/build/
-/demo/E2SFlash/app/build/
-/demo/E2SFlash/app/src/main/assets-*/
-/demo/E2SFlash/app/src/main/assets/
-
-# ---------- 5. 阅读固件：只收文档 ----------
-# 源码、字体 blob、模拟器输出、构建脚本均不入库（许可与体积原因）
+# ---------- 5. 阅读固件：firmware/e2_e2s_mp 源码 ----------
 !/firmware/
 !/firmware/e2_e2s_mp/
-!/firmware/e2_e2s_mp/README.md
-!/firmware/e2_e2s_mp/docs/
-!/firmware/e2_e2s_mp/docs/BUILD.md
-!/firmware/e2_e2s_mp/docs/COPY_DECK.md
-!/firmware/e2_e2s_mp/docs/DESIGN.md
-!/firmware/e2_e2s_mp/docs/KEYMAP.md
-!/firmware/e2_e2s_mp/docs/PORT_SPEC.md
-!/firmware/e2_e2s_mp/docs/PROTOCOL.md
-!/firmware/e2_e2s_mp/docs/images/
-!/firmware/e2_e2s_mp/docs/images/screens.png
-!/firmware/e2_e2s_mp/docs/research/
-!/firmware/e2_e2s_mp/docs/research/miaopaper.md
-!/firmware/e2_e2s_mp/docs/research/platform.md
-!/firmware/e2_e2s_mp/docs/research/stock_ui.md
+!/firmware/e2_e2s_mp/main/
+!/firmware/e2_e2s_mp/components/
+!/firmware/e2_e2s_mp/sim/
+!/firmware/e2_e2s_mp/tools/
+!/firmware/e2_e2s_mp/CMakeLists.txt
+!/firmware/e2_e2s_mp/partitions.csv
+!/firmware/e2_e2s_mp/sdkconfig.defaults
+!/firmware/e2_e2s_mp/main/**
+!/firmware/e2_e2s_mp/components/**
+!/firmware/e2_e2s_mp/sim/**
+!/firmware/e2_e2s_mp/tools/**
 
-# ---------- 6. 兜底排除（防止误放行） ----------
+/firmware/e2_e2s_mp/build/
+/firmware/e2_e2s_mp/sdkconfig
+/firmware/e2_e2s_mp/docs/
+/firmware/e2_e2s_mp/sim/build/
+/firmware/e2_e2s_mp/sim/out/
+
+# ---------- 6. 演示固件：firmware/badapple 源码 ----------
+!/firmware/badapple/
+!/firmware/badapple/main/
+!/firmware/badapple/tools/
+!/firmware/badapple/README.md
+!/firmware/badapple/CMakeLists.txt
+!/firmware/badapple/sdkconfig.defaults
+!/firmware/badapple/main/**
+!/firmware/badapple/tools/**
+
+/firmware/badapple/build/
+/firmware/badapple/sdkconfig
+
+# ---------- 7. 兜底排除 ----------
 **/keystore/
 **/keystore.properties
 **/local.properties
@@ -110,11 +122,9 @@
 **/__pycache__/
 **/*.pyc
 **/*.apk
-**/*.bin
 **/*.elf
 **/*.map
-**/assets-r*/
-**/.README.md.kate-swp
+**/*.kate-swp
 **/*.swp
 
 # 体积大 / 含真实数据或第三方版权，永不入库
@@ -122,21 +132,14 @@
 /apk_pull/
 /decompiled/
 /downloads/
+/dump/
 /fw_analysis/
 /model/
 /promo_video/
 /refs/
 /video/
-/build/
 /tools/
 /.zcode/
 /docs/PROMO_VIDEO_SCRIPT.md
-/firmware/badapple/
 /firmware/e2s_re/
 /firmware/hello_paperang/
-/firmware/e2_e2s_mp/main/
-/firmware/e2_e2s_mp/components/
-/firmware/e2_e2s_mp/sim/
-/firmware/e2_e2s_mp/tools/
-/firmware/e2_e2s_mp/build/
-/firmware/e2_e2s_mp/sdkconfig

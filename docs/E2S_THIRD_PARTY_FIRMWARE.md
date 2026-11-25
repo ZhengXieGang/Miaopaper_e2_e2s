@@ -326,7 +326,7 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=5
 | 路径 | 用途 |
 |---|---|
 | `dump/e2s_flash_8mb_r5.bin` | 原厂 8 MB 整片 dump（恢复基线） |
-| `dump/FLASH_DUMP_FINDINGS.md` | dump 解析结论（分区/字体/NVS/身份） |
+| `docs/FLASH_DUMP_FINDINGS.md` | dump 解析结论（分区/字体/NVS/身份） |
 | `tools/e2s_ble_flash.py` | scan/info/restore/flash/dump/full；`--force` 跳过低电量门限 |
 | `tools/e2s_flash_check.py` | 分区表/otadata/app 描述符校验 |
 | `firmware/hello_paperang` | 最小 BLE + EPD + A5 示例；8×16 字体 |

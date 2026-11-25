@@ -20,10 +20,10 @@
 | 事实 | 值 | 证据 |
 |---|---|---|
 | SoC | ESP32-S3,8 段 app 镜像,magic 0xE9 | `dump/e2s_flash_8mb_r5.bin` @0x210000;`docs/FLASH_DUMP_FINDINGS.md:48-57` |
-| 内部 flash | **8 MiB**,GD25Q64,JEDEC `C8 40 17` | `docs/E2S_THIRD_PARTY_FIRMWARE.md:26`;dump 文件 8,388,608 B;`dump/FLASH_DUMP_FINDINGS.md:22-23` |
-| flash 模式 | DIO,80 MHz,容量码 8 MiB | `docs/E2S_THIRD_PARTY_FIRMWARE.md:27`;`badapple/sdkconfig:530-535`;`dump/FLASH_DUMP_FINDINGS.md:44` |
+| 内部 flash | **8 MiB**,GD25Q64,JEDEC `C8 40 17` | `docs/E2S_THIRD_PARTY_FIRMWARE.md:26`;dump 文件 8,388,608 B;`docs/FLASH_DUMP_FINDINGS.md:22-23` |
+| flash 模式 | DIO,80 MHz,容量码 8 MiB | `docs/E2S_THIRD_PARTY_FIRMWARE.md:27`;`badapple/sdkconfig:530-535`;`docs/FLASH_DUMP_FINDINGS.md:44` |
 | 运行时分区表 | nvs 0x9000/0x6000;otadata 0xF000/0x2000;phy_init 0x11000/0x1000;ota_0 0x20000/0x1F0000;ota_1 0x210000/0x1F0000 | 本次 `od -A x -t x1z -j 0x8000 -N 160 dump/e2s_flash_8mb_r5.bin` 逐字节读出(见 §2) |
-| otadata 现状 | entry0 seq=43,state=0xFFFFFFFF,CRC 0x88CCD7C0 → ota_0 | 本次 `od ... -j 0xf000 -N 64`;`dump/FLASH_DUMP_FINDINGS.md:62-72` |
+| otadata 现状 | entry0 seq=43,state=0xFFFFFFFF,CRC 0x88CCD7C0 → ota_0 | 本次 `od ... -j 0xf000 -N 64`;`docs/FLASH_DUMP_FINDINGS.md:62-72` |
 | PSRAM | 原厂代码确实用 `MALLOC_CAP_SPIRAM`(LVGL 32 KB 池、FreeType 堆、EPD 帧缓冲 4000 B);容量 2 MB **仅来自设备自报 JSON,未实测** | `e2s_re/docs/VERSIONS.md:69,87-88`;`e2s_re/components/ble/paperang_ble.c:97-101`;本次反汇编 0x4202a9d7-0x4202a9e0 |
 | 面板 | 2.13" 墨水屏,250×122 可视,1bpp,**面板 RAM = 250 行 × 16 B = 4000 B**(250×128 位,122 行有效,每行 6 bit 填充) | `hello_paperang/README.md:18-25`;`badapple/main/epd.h:12-13`;`badapple/main/epd.c:193-210`;原厂 `heap_caps_malloc(0xfa0=4000, 0x400)` @0x4202a9d7 |
 | LVGL 画布 | 250×128(full_refresh 位被置 1,但 pristine v8.2 会因 8000 px 缓冲清 0 → 实际 32 行/band) | `e2s_re/docs/VERSIONS.md:20,96`;`e2s_re/components/pgui/pgui_api.c:20-36` |
@@ -37,8 +37,8 @@
 | 充电/电源输入 | GPIO5 配成输入并读取,`level==0` 作布尔返回(疑似充电检测,语义未确认) | 本次反汇编 0x4202dbd0-0x4202dbf5;调用者见 `tools/fw_ext/func_callers.json`(0x420299b0/0x4202ac1c/0x4202e158 等) |
 | SD | **SDMMC 4-bit**:CLK=11,CMD=12,D0=13,D1=14,D2=9,D3=10,内部上拉,slot 1;挂载 `/sdcard`,FATFS;另有 **SD 电源/复位控制脚 GPIO34(挂载期间保持低,置低后延时 50 ms 再挂载;卸载后置高)** | 本次反汇编 0x42009bf4-0x42009c20(槽位字段直写 11/12/13/14/9/10,width=4,flags=1)、0x42009b34-0x42009b76(置低+50 tick,保持低)、0x42009ce5(卸载置高) |
 | SD 挂载重试 | 3 次,间隔 500 ms;失败只打印 `FATAL: SD card error` **然后继续启动**,不 return | 本次反汇编 0x420099a5-0x420099d7、0x42009ac4-0x42009acd |
-| 字体区(分区表外) | 0x480000–0x528884,含 3 个 FTF(`0x40` B 头 + TTF);0x520000–0x528884 是 1bpp 位图缓存 | `dump/FLASH_DUMP_FINDINGS.md:88-123`;本次 od 逐段核对 |
-| 空白区 | 0x12000–0x20000(57,344 B)、0x400000–0x480000(512 KiB)、0x528884 以后到 0x800000(约 2.84 MiB)全 0xFF | `dump/FLASH_DUMP_FINDINGS.md:46,91`;`badapple/main/playback.c:45-46` |
+| 字体区(分区表外) | 0x480000–0x528884,含 3 个 FTF(`0x40` B 头 + TTF);0x520000–0x528884 是 1bpp 位图缓存 | `docs/FLASH_DUMP_FINDINGS.md:88-123`;本次 od 逐段核对 |
+| 空白区 | 0x12000–0x20000(57,344 B)、0x400000–0x480000(512 KiB)、0x528884 以后到 0x800000(约 2.84 MiB)全 0xFF | `docs/FLASH_DUMP_FINDINGS.md:46,91`;`badapple/main/playback.c:45-46` |
 | CPU 频率 | badapple/hello 240 MHz;e2s_re 生成的 sdkconfig 是 160 MHz | `badapple/sdkconfig:1494`;`e2s_re/sdkconfig:2656`;`docs/E2S_THIRD_PARTY_FIRMWARE.md:212` |
 | 看门狗 | `CONFIG_ESP_TASK_WDT_TIMEOUT_S=5` | `badapple/sdkconfig:1576`;`docs/E2S_THIRD_PARTY_FIRMWARE.md:221` |
 
@@ -51,7 +51,7 @@
 | 主张 | 出处 |
 |---|---|
 | 4 MB | `e2s_re/sdkconfig.defaults:12-13`(注释 `device info JSON "RomSize":"4M"`)、`e2s_re/partitions_re.csv:2`、`hello_paperang/README.md:104`("内部 4 MB flash") |
-| 8 MB | 两个 8,388,608 B 的整片 dump(`dump/e2s_flash_8mb_r5.bin`/`r6.bin`,SHA 相同);`dump/FLASH_DUMP_FINDINGS.md:22-23`;`docs/E2S_THIRD_PARTY_FIRMWARE.md:26`(GD25Q64,JEDEC C8 40 17);`badapple/README.md:109`;`badapple/sdkconfig:539`、`hello_paperang/sdkconfig.defaults:2` |
+| 8 MB | 两个 8,388,608 B 的整片 dump(`dump/e2s_flash_8mb_r5.bin`/`r6.bin`,SHA 相同);`docs/FLASH_DUMP_FINDINGS.md:22-23`;`docs/E2S_THIRD_PARTY_FIRMWARE.md:26`(GD25Q64,JEDEC C8 40 17);`badapple/README.md:109`;`badapple/sdkconfig:539`、`hello_paperang/sdkconfig.defaults:2` |
 
 ### 2.2 权威来源与结论
 
@@ -382,7 +382,7 @@ FT_Error  ft_library_init(void);  /* 静态 FT_LibraryRec + 18 模块 */
 | `Zpix-Regular` TTF | dump **0x480040**,长度 **392,196 B**(FTF 头在 0x480000) | 本次 `dd` 提取到 /tmp 后 `file` 识别为 TrueType 11 表;fontTools 读出 **2190 个 cmap 项**,含"中/文/A",name=`Zpix Regular` | **可直接复制/提取**:OFL 许可;是最省事的中文来源 |
 | Alibaba PuHuiTi Light 子集 1 | dump **0x4DFC84**,81,984 B | FTF 头 + 标准 TTF(`od` 验证 sfnt 00 01 00 00) | 数据可用,但**商业字体,不可公开分发**(`FLASH_DUMP_FINDINGS.md:123`) |
 | Alibaba PuHuiTi Light 子集 2 | dump **0x4FB7E4**,146,108 B | 同上 | 同上 |
-| FTF 容器 | `0x40` B 头:`"FTTF"` + 名字(0x04)+ u32 TTF size(0x24)+ 0xFFFFFFFF(0x28)+ 0x00010001(0x2C)+ u32(0x30,与 Zpix 的 2190 一致)+ TTF 从 0x40 开始 | `dump/FLASH_DUMP_FINDINGS.md:107-118`;本次 od 逐字段核对 | 读取原厂字库时需要 |
+| FTF 容器 | `0x40` B 头:`"FTTF"` + 名字(0x04)+ u32 TTF size(0x24)+ 0xFFFFFFFF(0x28)+ 0x00010001(0x2C)+ u32(0x30,与 Zpix 的 2190 一致)+ TTF 从 0x40 开始 | `docs/FLASH_DUMP_FINDINGS.md:107-118`;本次 od 逐字段核对 | 读取原厂字库时需要 |
 | 位图缓存 | dump **0x520000–0x528884**(约 34.6 KB,1bpp 图案) | `FLASH_DUMP_FINDINGS.md:120-121` | 未确认用途,不要依赖 |
 
 ### 4.9 A5 / 刷机 / 恢复工具
@@ -446,7 +446,7 @@ FT_Error  ft_library_init(void);  /* 静态 FT_LibraryRec + 18 模块 */
 
 1. **只写 app 槽**:不写 bootloader、分区表、NVS、phy_init;不是恢复操作时不动 otadata;`ota_1`(0x210000–0x400000)永远不碰(`docs/E2S_THIRD_PARTY_FIRMWARE.md:11-12`;`hello_paperang/README.md:52`;`badapple/README.md:28`)。
 2. **不用 `idf.py flash`**;产物是 app-only 镜像,经原厂 OTA 或 `tools/e2s_ble_flash.py` 写入(`hello_paperang/README.md:50-52`)。
-3. **不初始化/擦除原厂 NVS**;`sn`/`key`/`bind`/`cal_data`/`cal_mac` 是设备身份,不打印、不外传(`docs/E2S_THIRD_PARTY_FIRMWARE.md:137`;`dump/FLASH_DUMP_FINDINGS.md:76-86`)。
+3. **不初始化/擦除原厂 NVS**;`sn`/`key`/`bind`/`cal_data`/`cal_mac` 是设备身份,不打印、不外传(`docs/E2S_THIRD_PARTY_FIRMWARE.md:137`;`docs/FLASH_DUMP_FINDINGS.md:76-86`)。
 4. **冷启动第一帧必须全刷**,否则整屏空白、会被误判为"没启动"(`docs/E2S_THIRD_PARTY_FIRMWARE.md:16,153`)。
 5. **app_main 不能因 BLE 失败而 return**;面板/UI 必须独立启动(`docs/E2S_THIRD_PARTY_FIRMWARE.md:15`;正面例子 `badapple/main/main.c:365-382`,反面例子 `hello_paperang/main/main.c:296-303`)。
 6. **SD 失败不能中止启动**;显示"无卡/错误"并保持 BLE 恢复通道(原厂行为见 §3.6)。

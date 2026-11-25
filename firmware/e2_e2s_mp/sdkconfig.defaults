@@ -1,0 +1,62 @@
+# e2s_mp sdkconfig defaults — same hardware configuration as e2s_reader.
+# Flash/partition facts come from the 8 MiB dump (INVENTORY §2.2/§2.3).
+CONFIG_IDF_TARGET="esp32s3"
+
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+CONFIG_SPIRAM=n
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# PORT_SPEC §10.5: mp_app_run() lives on the main task; mp_ui_state_t (~800 B)
+# + mp_page_t (~470 B) + the call depth need 8192, not the reader's 6144.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# NimBLE, no NVS persistence, no bonding (same red line as e2s_reader).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# Central + GATT client are enabled ONLY for the device-initiated ATT MTU
+# exchange (mp_ble.c: exchange_mtu_best_effort). We never scan or initiate a
+# connection; without this, Windows (which never sends Exchange MTU Request)
+# stays at MTU 23 and the 160 B 0x33 chunks cannot be notified.
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_GATT_CLIENT=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+
+# NimBLE buffer sizing (PORT_SPEC §7.2). IDF v6.1.1 renamed these Kconfig
+# symbols again (components/bt/sdkconfig.rename:280-283), so the spec's
+# BT_NIMBLE_ACL_BUF_COUNT / ACL_BUF_SIZE / HCI_EVT_BUF_SIZE / MSYS1_BLOCK_COUNT
+# would be ignored as unknown here. Same four buffers under the v6 names:
+# 24 x 255 B ACL + 24 msys blocks must absorb the web tool's 24 x 243 B window
+# (a 1 MB upload has to show dropped == 0). On ESP32-S3 the msys default is 12,
+# so the explicit 24 is a real change; the other three pin the defaults.
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=24
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE=255
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_SIZE=70
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
+
+CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n
+CONFIG_ESP_WIFI_NVS_ENABLED=n
+
+# 电源管理：DFS 动态调频 + FreeRTOS Tickless Idle 自动轻睡 + BLE Modem Sleep
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=3
+CONFIG_BT_CTRL_MODEM_SLEEP=y
+CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y
+CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y
+CONFIG_BT_CTRL_MAIN_XTAL_PU_DURING_LIGHT_SLEEP=y
+CONFIG_BT_CTRL_DFT_TX_POWER_LEVEL_P3=y

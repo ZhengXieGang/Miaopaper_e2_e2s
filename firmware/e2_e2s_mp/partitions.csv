@@ -1,0 +1,19 @@
+# e2s_reader compile-time partition table — app-only builds only.
+#
+# This now matches the REAL device table, decoded byte-exactly from the
+# 8 MiB dump at 0x8000 (dump/e2s_flash_8mb_r5.bin, INVENTORY §2.2/§2.3):
+#   nvs 0x9000/0x6000, otadata 0xF000/0x2000, phy_init 0x11000/0x1000,
+#   ota_0 0x20000/0x1F0000, ota_1 0x210000/0x1F0000  (8 MiB flash)
+#
+# Keeping this identical to the device table makes build/flash_args use the
+# right offsets (previous e2s_re-derived table put app at 0x10000, inside the
+# real otadata). It does NOT make `idf.py flash` safe: that command still
+# writes the bootloader, partition table and ota_data_initial. Only app-only
+# images are supported — use tools/flash_app.sh, never idf.py flash.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+otadata,    data, ota,     0xf000,   0x2000,
+phy_init,   data, phy,     0x11000,  0x1000,
+ota_0,      app,  ota_0,   0x20000,  0x1F0000,
+ota_1,      app,  ota_1,   0x210000, 0x1F0000,
