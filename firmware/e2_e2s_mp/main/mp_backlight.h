@@ -23,8 +23,11 @@ bool mp_backlight_supported(void);
 /* 设置背光档位（0..3 截断/夹紧）。无背光或 I2C 错误返回 -1（非致命）。 */
 int mp_backlight_set(uint8_t level);
 
-/* 锁屏/深睡前令 AW2023 进入 STANDBY 并释放设备句柄（无背光时直接返回）。 */
+/* 锁屏前令 AW2023 进入 STANDBY 并释放设备句柄（保留总线便于解锁秒亮）。 */
 void mp_backlight_suspend(void);
+
+/* 进深睡前令 AW2023 进入 STANDBY 并彻底关闭 I2C 总线，消除上拉漏电。 */
+void mp_backlight_deep_sleep(void);
 
 /* 返回最近一次尝试设置的档位（0..3）。 */
 uint8_t mp_backlight_level(void);

@@ -63,7 +63,8 @@
 
 #define MP_LIST_TOP 20                /* 第 0 行顶；4 行块在 19..103 内居中 */
 #define MP_LIST_STEP 21               /* 20 px 高亮条 + 1 px 间距 */
-#define MP_LIST_ROWS 4                /* 可见 4 行 */
+#define MP_LIST_ROWS 4                /* 列表可见 4 行 */
+#define MP_UI_ROW_CAP 5               /* 视图模型行容量（BOOK_INFO 5 按钮） */
 #define MP_SEL_RULE_W 16              /* 兼容旧函数原型保留 */
 #define MP_SEL_RULE_H 1
 #define MP_SEL_RULE_DY 18
@@ -92,17 +93,18 @@
 #define MP_MSG_TOP3 34                /* 三行消息默认起点 */
 #define MP_MSG_STEP 20
 
-/* BOOK_INFO：元信息 + 点线 + 2x2 圆角按钮网格。 */
+/* BOOK_INFO：元信息 + 点线 + 5 按钮 2+3 圆角网格（2x114 + 3x74，总宽均 234）。 */
 #define MP_INFO_META_TOP 22
 #define MP_INFO_RULE_Y 41
 #define MP_INFO_BTN_W 114
+#define MP_INFO_BTN3_W 74
 #define MP_INFO_BTN_H 22
 #define MP_INFO_BTN_GAP_X 6
 #define MP_INFO_BTN_GAP_Y 6
 #define MP_INFO_BTN_TOP 47
 #define MP_INFO_ACT_TOP 37
 #define MP_INFO_ACT_STEP 17
-#define MP_INFO_ACT_ROWS 4
+#define MP_INFO_ACT_ROWS 5
 
 /* JUMP / TIME_SET：布局常量。 */
 #define MP_BIG_VALUE_BASE 74          /* 兼容旧宏保留 */
@@ -148,6 +150,8 @@ typedef enum {
     MP_SCREEN_ERROR,
     MP_SCREEN_RESTORE,
     MP_SCREEN_BOOK_INFO,  /* READ 的 MENU 信息页 */
+    MP_SCREEN_TOC,        /* 章节目录列表页 */
+    MP_SCREEN_TOC_EMPTY,  /* 未识别到章节提示页 */
     MP_SCREEN_JUMP,       /* 跳转到百分比 */
     MP_SCREEN_DELETE,     /* 删除本书确认页 */
     MP_SCREEN_TIME_SET,   /* 年/月/日/时/分 向导 */
@@ -211,18 +215,18 @@ typedef struct {
     uint8_t bt_on;              /* 1 = 显示蓝牙图标；0 = 不显示 */
     uint8_t battery;            /* 0..100 */
     uint8_t battery_valid;      /* 0 = 只画外壳 */
-    uint8_t charging;           /* 1 = 外壳左侧 '+' */
+    uint8_t charging;           /* 1 = 电池左侧显示小闪电图标 */
 
     /* --- 日期 / 时间设置 --- */
     uint16_t year;
     uint8_t month, day, week;   /* week: 1=周一 … 7=周日 */
     uint8_t time_step;          /* 0=年 1=月 2=日 3=时 4=分 */
 
-    /* --- select / settings / info 列表 --- */
-    uint8_t row_count;          /* 逻辑行数（可 > MP_LIST_ROWS） */
-    uint8_t sel;                /* 选中下标（逻辑行号） */
-    uint8_t scroll;             /* 首行下标 */
-    mp_ui_row_t row[MP_LIST_ROWS];
+    /* --- select / settings / toc / info 列表 --- */
+    uint16_t row_count;         /* 逻辑行数（目录最高支持 2048 章） */
+    uint16_t sel;               /* 选中下标（逻辑行号） */
+    uint16_t scroll;            /* 首行下标 */
+    mp_ui_row_t row[MP_UI_ROW_CAP];
 
     /* --- read --- */
     uint8_t line_count;
@@ -255,12 +259,15 @@ typedef struct {
     uint8_t bl_level;           /* 背光亮度 0..3（0=关闭） */
     uint8_t bl_popup;           /* 1 = 居中叠加快捷背光调整浮窗 */
 
+    /* --- charging popup --- */
+    uint8_t charge_popup;       /* 1 = 居中叠加充电提示浮窗（插入充电器 5 秒自动消失） */
+
     /* 1 = 不画底栏（恢复成功页 / 时间设置完成页）。 */
     uint8_t hide_hints;
 } mp_ui_state_t;
 
 /* 列表滚动（冻结规则）：装得下就不滚；装不下时让选中项尽量贴底。 */
-static inline uint8_t mp_ui_list_scroll(uint8_t sel, uint8_t row_count)
+static inline uint16_t mp_ui_list_scroll(uint16_t sel, uint16_t row_count)
 {
     if (row_count <= MP_LIST_ROWS) {
         return 0;
@@ -273,7 +280,7 @@ static inline uint8_t mp_ui_list_scroll(uint8_t sel, uint8_t row_count)
     if (s > max) {
         s = max;
     }
-    return (uint8_t)s;
+    return (uint16_t)s;
 }
 
 /* ------------------------------------------------------------------ *
@@ -299,6 +306,7 @@ void mp_ui_jump(uint8_t *fb, const mp_ui_state_t *st);
 void mp_ui_time_set(uint8_t *fb, const mp_ui_state_t *st);
 void mp_ui_backlight(uint8_t *fb, const mp_ui_state_t *st);
 void mp_ui_backlight_popup(uint8_t *fb, const mp_ui_state_t *st);
+void mp_ui_charge_popup(uint8_t *fb, const mp_ui_state_t *st);
 void mp_ui_low_batt(uint8_t *fb);
 
 /* ------------------------------------------------------------------ *

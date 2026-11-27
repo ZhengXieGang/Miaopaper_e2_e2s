@@ -414,8 +414,16 @@ void mp_backlight_suspend(void)
     }
     dev_close();
     bl_io_release();
-    /* 锁屏或进深睡前无条件释放常亮锁，恢复完整轻睡/深睡功耗控制 */
+    /* 锁屏前无条件释放常亮锁，恢复完整轻睡/深睡功耗控制 */
     bl_hold_awake(false);
+}
+
+void mp_backlight_deep_sleep(void)
+{
+    mp_backlight_suspend();
+    bl_io_acquire();
+    bus_close();
+    bl_io_release();
 }
 
 uint8_t mp_backlight_level(void)

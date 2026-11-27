@@ -24,9 +24,11 @@
 #include "mp_app.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_newlib.h"
 #include "sdkconfig.h"
@@ -47,8 +49,10 @@
 #include "input.h"
 #include "mp_backlight.h"
 #include "mp_hints.h"
+#include "mp_ota.h"
 #include "mp_page.h"
 #include "mp_store.h"
+#include "mp_toc.h"
 #include "mp_ui.h"
 #include "power.h"
 #include "rc_common.h"
@@ -71,9 +75,6 @@ _Static_assert(MP_ENC_ASCII == 0, "MP_ENC_ASCII drifted");
 _Static_assert(MP_ENC_GB2312 == 1, "MP_ENC_GB2312 drifted");
 _Static_assert(MP_FB_BYTES == READER_FB_BYTES, "frame size drifted");
 _Static_assert(MP_TITLE_MAX == MP_BLE_TITLE_MAX, "title length drifted");
-
-/* COPY_DECK §3.7：构建行用编译期常量，不用 __DATE__（可复现构建）。 */
-#define MP_BUILD_DATE "2026-11-25"
 
 /* 未同步时的默认时间：2026-01-01 00:00:00（PORT_SPEC §7.5）。 */
 #define MP_TIME_DEFAULT_UNIX 1767225600u
@@ -101,14 +102,14 @@ static uint8_t s_lock_valid;
 /* 视图模型（~800 B，静态以避免吃主任务栈）。 */
 static mp_ui_state_t s_ui;
 
-/* 目录缓存：s_done[i] 是第 i 本 DONE 书的槽号，s_books[i] 是它的目录项。 */
-static uint8_t s_done[MP_MAX_BOOKS];
-static mp_book_t s_books[MP_MAX_BOOKS];
-static uint8_t s_done_n;
+/* 动态书库列表：仅缓存 DONE 槽号（每本 2 B），标题渲染时按可见 4 行窗口现读。 */
+static uint16_t *s_done;
+static uint16_t s_done_cap;
+static uint16_t s_done_n;
 
 /* 当前书的渲染属性（mp_app_state 里没有 enc/title 字段）。 */
 typedef struct {
-    uint8_t idx;
+    uint16_t idx;
 } book_ctx_t;
 static book_ctx_t s_book_ctx;
 static uint8_t s_book_enc = MP_ENC_ASCII;
@@ -129,9 +130,9 @@ static uint8_t s_status_pending;
 static uint32_t s_status_due_ms;
 
 /* BLE 上传会话（同一时刻只允许一个）。 */
-enum { UP_NONE = 0, UP_BOOK, UP_FONT, UP_LOCK };
+enum { UP_NONE = 0, UP_BOOK, UP_FONT, UP_LOCK, UP_OTA };
 static uint8_t s_up_kind;
-static uint8_t s_up_slot = 0xFF;
+static uint16_t s_up_slot = MP_SLOT_INVALID;
 static uint32_t s_up_written;
 static uint32_t s_up_total;
 static uint32_t s_up_notified;
@@ -144,9 +145,10 @@ enum { ERR_NONE = 0, ERR_STORAGE, ERR_RECOVERY, ERR_DISPLAY };
 static uint8_t s_error_kind;
 static int s_error_rc;
 
-/* 电量去重（用于 0x2A19 / 广播）。 */
+/* 电量与充电去重（用于 0x2A19 / 广播 / 插入充电器弹窗触发）。 */
 static uint8_t s_last_batt;
 static uint8_t s_batt_valid;
+static uint8_t s_last_charging;
 
 static uint8_t s_dirty;
 static uint8_t s_booted;
@@ -158,16 +160,22 @@ static uint32_t s_stats_last_save_ms;
 static TaskHandle_t s_app_task;
 
 /* 跨深睡保持状态：保存在 RTC 慢速内存（重启清零、深睡保留）。 */
-#define MP_RTC_MAGIC 0x4D505331u
+#define MP_RTC_MAGIC 0x4D505332u
 RTC_DATA_ATTR static struct {
     uint32_t magic;
     uint8_t deep_locked;       /* 1 = 由锁屏进入深睡，醒来按需回原画面 */
     uint8_t locked_from_read;  /* 1 = 唤醒后直接恢复上次阅读页 */
-    uint8_t book_idx;
-    uint8_t time_synced;       /* 1 = POSIX RTC 已校准过有效时间 */
+    uint16_t book_idx;
+    uint8_t time_synced;       /* 1 = POSIX RTC 已初始化，可跨深睡连续走时 */
+    uint8_t clock_calibrated;  /* 1 = 时间曾对时/恢复过，允许落盘 clock.bin */
+    uint16_t rsv;
     uint32_t char_pos;
 } s_rtc;
 static uint8_t s_woke_unlock;  /* 本次冷启动是否通过长按 ○ 从锁屏深睡成功唤醒 */
+static uint8_t s_woke_charge;  /* 本次冷启动是否由插充电器 EXT1 唤醒 */
+static uint32_t s_clock_saved_unix; /* 上次写入 /sdcard/mp/clock.bin 的时间戳 */
+static uint8_t s_lock_ok_down;      /* 浅锁屏态正在按住 ○ 键等待满 2 秒唤醒 */
+static uint32_t s_lock_ok_down_ms;  /* 浅锁屏态 ○ 键按下时刻 */
 
 #ifdef CONFIG_PM_ENABLE
 static esp_pm_lock_handle_t s_pm_cpu_lock;
@@ -182,7 +190,14 @@ static char s_buf_space[64];
 static char s_buf_set[8][32];
 static char s_buf_about[4][72];
 static char s_buf_info[96];
-static char s_buf_info_act[4][32];
+static char s_buf_info_act[MP_INFO_ACT_ROWS][32];
+static char s_buf_select[MP_LIST_ROWS][MP_TITLE_MAX + 1];
+
+/* 章节目录页窗口缓存：仅保存当前屏幕可见 4 行，不在 RAM 常驻整本目录。 */
+static mp_toc_entry_t s_toc_win[MP_LIST_ROWS];
+static uint16_t s_toc_win_scroll;
+static uint8_t s_toc_win_n;
+static uint8_t s_toc_win_valid;
 
 /* ------------------------------------------------------------------ *
  * 小工具
@@ -193,9 +208,18 @@ static uint32_t now_ms(void)
     return (uint32_t)rc_now_ms();
 }
 
-static void app_wake(void)
+static void IRAM_ATTR app_wake(void)
 {
-    if (s_app_task != NULL) {
+    if (s_app_task == NULL) {
+        return;
+    }
+    if (xPortInIsrContext()) {
+        BaseType_t hp = pdFALSE;
+        vTaskNotifyGiveFromISR(s_app_task, &hp);
+        if (hp) {
+            portYIELD_FROM_ISR();
+        }
+    } else {
         xTaskNotifyGive(s_app_task);
     }
 }
@@ -237,10 +261,24 @@ static void upload_pm_release(void)
 #endif
 }
 
-/* 锁存分压控制(GPIO45=低)与 SD 电源脚(GPIO34=高)，消除深睡期间漏电。 */
+/* 锁存分压控制(GPIO45=低)与 SD 电源脚(GPIO34=高)，并释放 SD 数据线上拉防倒灌漏电。
+ * 不调用 gpio_deep_sleep_hold_en()，避免全局锁死无关数字脚与外设引脚。 */
 static void sleep_hold_power_pins(void)
 {
-    /* 先解除运行期锁存状态，再切向高电平确保 SD 与外设可靠断电 */
+    gpio_deep_sleep_hold_dis();
+
+    /* SD 卡已通过 GPIO34=1 断电，将 6 根 SDMMC 信号线置浮空输入防止经 ESD 二极管倒灌漏电。 */
+    static const gpio_num_t sd_pins[] = {
+        (gpio_num_t)BOARD_SD_PIN_CLK, (gpio_num_t)BOARD_SD_PIN_CMD,
+        (gpio_num_t)BOARD_SD_PIN_D0,  (gpio_num_t)BOARD_SD_PIN_D1,
+        (gpio_num_t)BOARD_SD_PIN_D2,  (gpio_num_t)BOARD_SD_PIN_D3,
+    };
+    for (size_t i = 0; i < sizeof(sd_pins) / sizeof(sd_pins[0]); i++) {
+        (void)gpio_reset_pin(sd_pins[i]);
+        (void)gpio_set_pull_mode(sd_pins[i], GPIO_FLOATING);
+    }
+
+    /* 先解除运行期锁存状态，再精确锁存分压使能(低)与 SD 电源(高)两脚。 */
     (void)gpio_hold_dis(BOARD_VBAT_EN_GPIO);
     (void)gpio_hold_dis(BOARD_SD_PWR_GPIO);
     (void)gpio_set_direction(BOARD_VBAT_EN_GPIO, GPIO_MODE_OUTPUT);
@@ -249,13 +287,33 @@ static void sleep_hold_power_pins(void)
     (void)gpio_set_level(BOARD_SD_PWR_GPIO, 1);
     (void)gpio_hold_en(BOARD_VBAT_EN_GPIO);
     (void)gpio_hold_en(BOARD_SD_PWR_GPIO);
-    gpio_deep_sleep_hold_en();
+}
+
+/* 构造锁屏深睡 EXT1 唤醒掩码（对齐原厂 0x4202ac1c）：
+ *   - 未充电（GPIO5=高）：同时监听确认键 GPIO8 与充电检测 GPIO5，插线即可唤醒；
+ *   - 充电中（GPIO5=低）：仅监听确认键 GPIO8，防止低电平 GPIO5 触发秒醒循环。 */
+static uint64_t sleep_lock_wake_mask(void)
+{
+    uint64_t mask = (1ULL << BOARD_KEY_OK_GPIO);
+    gpio_config_t chg_cfg = {
+        .pin_bit_mask = 1ULL << BOARD_CHARGE_DET_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    (void)gpio_config(&chg_cfg);
+    if (gpio_get_level(BOARD_CHARGE_DET_GPIO) != 0) {
+        mask |= (1ULL << BOARD_CHARGE_DET_GPIO);
+    }
+    return mask;
 }
 
 /* 配置 EXT1 低电平唤醒并进入 deep sleep（永不返回）。 */
 static void __attribute__((noreturn)) enter_ext1_deep_sleep(uint64_t wake_mask)
 {
     if (wake_mask & (1ULL << BOARD_CHARGE_DET_GPIO)) {
+        (void)rtc_gpio_hold_dis(BOARD_CHARGE_DET_GPIO);
         (void)rtc_gpio_init(BOARD_CHARGE_DET_GPIO);
         (void)rtc_gpio_set_direction(BOARD_CHARGE_DET_GPIO,
                                      RTC_GPIO_MODE_INPUT_ONLY);
@@ -263,6 +321,7 @@ static void __attribute__((noreturn)) enter_ext1_deep_sleep(uint64_t wake_mask)
         (void)rtc_gpio_pullup_en(BOARD_CHARGE_DET_GPIO);
     }
     if (wake_mask & (1ULL << BOARD_KEY_OK_GPIO)) {
+        (void)rtc_gpio_hold_dis(BOARD_KEY_OK_GPIO);
         (void)rtc_gpio_init(BOARD_KEY_OK_GPIO);
         (void)rtc_gpio_set_direction(BOARD_KEY_OK_GPIO,
                                      RTC_GPIO_MODE_INPUT_ONLY);
@@ -270,6 +329,11 @@ static void __attribute__((noreturn)) enter_ext1_deep_sleep(uint64_t wake_mask)
         (void)rtc_gpio_pullup_en(BOARD_KEY_OK_GPIO);
     }
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+#if SOC_PM_SUPPORT_RTC_PERIPH_PD
+    /* 保持 RTC_PERIPH 供电：确保深睡期间 RTC 内部上拉真实有效，且阻止 IDF
+     * ext1_wakeup_prepare() 对唤醒脚施加 RTC_CNTL_PAD_HOLD 锁死。 */
+    (void)esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+#endif
 #if SOC_PM_SUPPORT_RTC_SLOW_MEM_PD
     (void)esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_ON);
 #endif
@@ -283,13 +347,34 @@ static void __attribute__((noreturn)) enter_ext1_deep_sleep(uint64_t wake_mask)
 
 void mp_app_early_wake_check(void)
 {
+    /* 必须最先解除数字与 RTC PAD HOLD，否则后续 rtc_gpio_deinit/gpio_config
+     * 写寄存器会被硬件锁存器屏蔽，导致无法读取确认键实时低电平而反复退回深睡。 */
     gpio_deep_sleep_hold_dis();
     (void)gpio_hold_dis(BOARD_SD_PWR_GPIO);
     (void)gpio_hold_dis(BOARD_VBAT_EN_GPIO);
+    (void)rtc_gpio_hold_dis(BOARD_CHARGE_DET_GPIO);
+    (void)rtc_gpio_hold_dis(BOARD_KEY_OK_GPIO);
     (void)rtc_gpio_deinit(BOARD_CHARGE_DET_GPIO);
     (void)rtc_gpio_deinit(BOARD_KEY_OK_GPIO);
 
-    if ((esp_sleep_get_wakeup_causes() & (1UL << ESP_SLEEP_WAKEUP_EXT1)) &&
+    uint32_t causes = esp_sleep_get_wakeup_causes();
+    uint64_t ext1 = (causes & (1UL << ESP_SLEEP_WAKEUP_EXT1))
+                        ? esp_sleep_get_ext1_wakeup_status()
+                        : 0ULL;
+
+    s_woke_unlock = 0;
+    s_woke_charge = 0;
+
+    /* 插充电线触发 EXT1 唤醒（无论来自锁屏深睡还是低电深睡）：直接放行开机并弹充电弹窗。 */
+    if (ext1 & (1ULL << BOARD_CHARGE_DET_GPIO)) {
+        s_woke_charge = 1;
+        if (s_rtc.magic == MP_RTC_MAGIC) {
+            s_rtc.deep_locked = 0;
+        }
+        return;
+    }
+
+    if ((causes & (1UL << ESP_SLEEP_WAKEUP_EXT1)) &&
         s_rtc.magic == MP_RTC_MAGIC && s_rtc.deep_locked) {
         gpio_config_t ok_cfg = {
             .pin_bit_mask = 1ULL << BOARD_KEY_OK_GPIO,
@@ -299,10 +384,22 @@ void mp_app_early_wake_check(void)
             .intr_type = GPIO_INTR_DISABLE,
         };
         (void)gpio_config(&ok_cfg);
+        /* 留出 10 ms 等待 RTC->数字 IO MUX 切换与上拉电平建立稳定后再采样。 */
+        vTaskDelay(pdMS_TO_TICKS(10));
 
+        /* 持续按住满 MP_WAKE_HOLD_MS（叠加启动耗时约 2 秒）即刻放行唤醒，无需松手；
+         * 采用连续 2 次高电平确认（40 ms 去抖），防止按键瞬间接触抖动误踢回深睡。 */
         uint32_t elapsed = 0;
-        while (gpio_get_level(BOARD_KEY_OK_GPIO) == 0 &&
-               elapsed < MP_WAKE_HOLD_MS) {
+        uint8_t high_streak = 0;
+        while (elapsed < MP_WAKE_HOLD_MS) {
+            if (gpio_get_level(BOARD_KEY_OK_GPIO) == 0) {
+                high_streak = 0;
+            } else {
+                high_streak++;
+                if (high_streak >= 2u) {
+                    break;
+                }
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
             elapsed += 20;
         }
@@ -312,12 +409,12 @@ void mp_app_early_wake_check(void)
             return;
         }
 
-        /* 短按误触：不挂载存储/屏幕，原样回到深睡状态。 */
+        /* 短按误触：不挂载存储/屏幕，原样回到深睡状态并保持充电脚唤醒与走时锚定。 */
         sleep_hold_power_pins();
-        enter_ext1_deep_sleep(1ULL << BOARD_KEY_OK_GPIO);
+        esp_sync_timekeeping_timers();
+        enter_ext1_deep_sleep(sleep_lock_wake_mask());
     }
 
-    s_woke_unlock = 0;
     if (s_rtc.magic == MP_RTC_MAGIC) {
         s_rtc.deep_locked = 0;
     }
@@ -365,26 +462,34 @@ static int store_space(uint64_t *total, uint64_t *free_bytes)
     return esp_vfs_fat_info("/sdcard", total, free_bytes) == ESP_OK ? 0 : -1;
 }
 
-/* 目录重扫：DONE 槽按槽号升序（mp_store_list_done 的顺序）。 */
+/* 目录重扫：DONE 槽按槽号升序（mp_store_list_done 的顺序），按需扩容 s_done。 */
 static void rescan_books(void)
 {
     s_done_n = 0;
     if (!mp_app_state.storage_ok) {
         return;
     }
-    int n = mp_store_list_done(s_done);
-    if (n < 0) {
-        n = 0;
+    uint16_t cnt = mp_store_count_done();
+    if (cnt == 0) {
+        return;
     }
-    if (n > MP_MAX_BOOKS) {
-        n = MP_MAX_BOOKS;
-    }
-    for (int i = 0; i < n; i++) {
-        if (mp_store_read(s_done[i], &s_books[i]) != 0) {
-            memset(&s_books[i], 0, sizeof(s_books[i]));
+    if (cnt > s_done_cap) {
+        uint32_t aligned = ((uint32_t)cnt + MP_SLOT_CHUNK - 1u) &
+                           ~(uint32_t)(MP_SLOT_CHUNK - 1u);
+        if (aligned > MP_MAX_SLOTS) {
+            aligned = MP_MAX_SLOTS;
+        }
+        uint16_t *grown =
+            (uint16_t *)realloc(s_done, (size_t)aligned * sizeof(uint16_t));
+        if (grown) {
+            s_done = grown;
+            s_done_cap = (uint16_t)aligned;
         }
     }
-    s_done_n = (uint8_t)n;
+    if (!s_done || s_done_cap == 0) {
+        return;
+    }
+    s_done_n = mp_store_list_done(s_done, s_done_cap);
 }
 
 /* ------------------------------------------------------------------ *
@@ -447,8 +552,31 @@ static int render(void)
     return 0;
 }
 
+/* 是否处于高频交互微调页（列表滚动 / 书籍菜单 / 进度滑块 / 时间调整 / 背光设置与快捷浮窗）：
+ * 此类页面交互时走 DISPLAY_MODE_PARTIAL 暂缓自动 GC 全刷，保证连按方向键跟手，
+ * 将挂起的 gc_pending 留到切回阅读/时钟等常规屏时一步合并清残影。 */
+static bool is_interactive_tune_screen(void)
+{
+    if (mp_app_state.bl_popup) {
+        return true;
+    }
+    switch (mp_app_state.screen) {
+    case MP_SCREEN_SELECT:
+    case MP_SCREEN_SETTINGS:
+    case MP_SCREEN_BOOK_INFO:
+    case MP_SCREEN_TOC:
+    case MP_SCREEN_JUMP:
+    case MP_SCREEN_TIME_SET:
+    case MP_SCREEN_BACKLIGHT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* 场景切换：按是否强刷一次性提交目标刷新模式，不再先局刷再阻塞等补全刷。
- * force_full：锁屏 / 解锁回阅读 / 开机首帧 / 错误页传 1，其余传 0（自动局刷 + 顺滑页内 GC）。
+ * force_full：锁屏 / 解锁回阅读 / 开机首帧 / 错误页传 1；切入微调页传 0 时走
+ * DISPLAY_MODE_PARTIAL 防卡顿，回到常规屏时走 DISPLAY_MODE_AUTO 顺手合并清残影。
  * 上传会话期间不重绘（§5.5）：只记脏标志，等会话结束后由主循环补画。 */
 static void scene_commit(uint8_t force_full)
 {
@@ -463,10 +591,15 @@ static void scene_commit(uint8_t force_full)
     if (render() != 0) {
         return;
     }
-    display_post(s_fb, force_full ? DISPLAY_MODE_FULL : DISPLAY_MODE_AUTO);
+    display_mode_t mode = force_full
+                              ? DISPLAY_MODE_FULL
+                              : (is_interactive_tune_screen()
+                                     ? DISPLAY_MODE_PARTIAL
+                                     : DISPLAY_MODE_AUTO);
+    display_post(s_fb, mode);
 }
 
-/* 屏内动作（翻页 / 移光标 / 改值）：只局刷，不等。上传期间同样跳过。 */
+/* 屏内动作（翻页 / 移光标 / 改值）：微调页走强局刷防卡顿，常规页走自动局刷 + 周期页内合并全刷。 */
 static void page_commit(void)
 {
     if (!display_ready() || mp_app_state.debug_mode) {
@@ -479,7 +612,8 @@ static void page_commit(void)
     if (render() != 0) {
         return;
     }
-    display_post(s_fb, DISPLAY_MODE_AUTO);
+    display_post(s_fb, is_interactive_tune_screen() ? DISPLAY_MODE_PARTIAL
+                                                    : DISPLAY_MODE_AUTO);
 }
 
 static void mark_dirty(void)
@@ -509,6 +643,7 @@ static void view_common(mp_ui_state_t *v)
     v->battery_valid = p->valid ? 1 : 0;
     v->charging = p->charging ? 1 : 0;
     v->bl_popup = mp_app_state.has_backlight ? mp_app_state.bl_popup : 0;
+    v->charge_popup = mp_app_state.charge_popup;
     v->bl_level = (v->bl_popup ||
                    (mp_app_state.has_backlight &&
                     mp_app_state.screen == MP_SCREEN_BACKLIGHT))
@@ -533,29 +668,35 @@ static void view_clock(mp_ui_state_t *v)
 
 static void view_select(mp_ui_state_t *v)
 {
-    /* 书数跟着标题走，状态栏中段留给居中时间（评审：避免 11:30 3/8 挤在
-     * 一起）。主页不显示书数。 */
-    snprintf(s_buf_mid, sizeof(s_buf_mid), "书库 %u/8", (unsigned)s_done_n);
+    /* 书数跟着标题走，状态栏中段留给居中时间（书籍数量不再设上限）。 */
+    snprintf(s_buf_mid, sizeof(s_buf_mid), "书库 %u", (unsigned)s_done_n);
     v->left.text = s_buf_mid;
     v->left.enc = MP_STR_UTF8;
     v->mid = NULL;
 
-    uint8_t rows = s_done_n;
-    uint8_t sel = mp_app_state.sel;
+    uint16_t rows = s_done_n;
+    uint16_t sel = mp_app_state.sel;
     if (rows == 0) {
         sel = 0;
     } else if (sel >= rows) {
-        sel = (uint8_t)(rows - 1);
+        sel = (uint16_t)(rows - 1u);
     }
     v->row_count = rows;
     v->sel = sel;
     v->scroll = mp_ui_list_scroll(sel, rows);
 
     for (uint8_t i = 0; i < MP_LIST_ROWS; i++) {
-        uint8_t idx = (uint8_t)(v->scroll + i);
+        uint32_t idx = (uint32_t)v->scroll + i;
         if (idx < s_done_n) {
-            v->row[i].label = s_books[idx].title;
-            v->row[i].enc = title_enc(s_books[idx].title);
+            mp_book_t b;
+            if (mp_store_read(s_done[idx], &b) == 0) {
+                memcpy(s_buf_select[i], b.title, sizeof(b.title));
+                s_buf_select[i][MP_TITLE_MAX] = '\0';
+            } else {
+                s_buf_select[i][0] = '\0';
+            }
+            v->row[i].label = s_buf_select[i];
+            v->row[i].enc = title_enc(s_buf_select[i]);
         } else {
             v->row[i].label = NULL;
             v->row[i].enc = MP_STR_UTF8;
@@ -743,21 +884,51 @@ static void view_settings(mp_ui_state_t *v)
     settings_fill(v, items, count);
 }
 
+/* 将 esp_app_desc_t.date（如 "Nov 27 2026" 或 "Nov  7 2026"）格式化为 YYYY-MM-DD。 */
+static void format_app_build_date(const char *idf_date, char *out, size_t cap)
+{
+    static const char *const k_mon[12] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+    if (!idf_date || !idf_date[0]) {
+        snprintf(out, cap, "----");
+        return;
+    }
+    unsigned mon = 0;
+    for (unsigned i = 0; i < 12u; i++) {
+        if (strncmp(idf_date, k_mon[i], 3u) == 0) {
+            mon = i + 1u;
+            break;
+        }
+    }
+    unsigned day = 0;
+    unsigned year = 0;
+    if (mon > 0 && idf_date[3] == ' ' &&
+        sscanf(idf_date + 4, "%u %u", &day, &year) == 2 &&
+        day >= 1u && day <= 31u && year >= 2000u && year <= 2199u) {
+        snprintf(out, cap, "%04u-%02u-%02u", year, mon, day);
+        return;
+    }
+    snprintf(out, cap, "%s", idf_date);
+}
+
 static void view_about(mp_ui_state_t *v)
 {
     v->left.text = "关于";
     v->left.enc = MP_STR_UTF8;
     v->mid = NULL;
 
-    /* 每次渲染关于页时刷新存储占用（MB）到第 4 行规格表 */
+    /* 每次渲染关于页时刷新存储占用（MB），版本号与构建日期直接读取镜像头单一真源。 */
     build_space_line();
+    const esp_app_desc_t *app = esp_app_get_description();
+    char bdate[20];
+    format_app_build_date(app->date, bdate, sizeof(bdate));
 
     snprintf(s_buf_about[0], sizeof(s_buf_about[0]), "%s",
              mp_app_state.has_backlight ? "Miaopaper E2S" : "Miaopaper E2");
-    snprintf(s_buf_about[1], sizeof(s_buf_about[1]), "固件 %u.%u.%u",
-             (unsigned)READER_VERSION_MAJOR, (unsigned)READER_VERSION_MINOR,
-             (unsigned)READER_VERSION_PATCH);
-    snprintf(s_buf_about[2], sizeof(s_buf_about[2]), "构建 %s", MP_BUILD_DATE);
+    snprintf(s_buf_about[1], sizeof(s_buf_about[1]), "固件 %s", app->version);
+    snprintf(s_buf_about[2], sizeof(s_buf_about[2]), "构建 %s", bdate);
     snprintf(s_buf_about[3], sizeof(s_buf_about[3]), "存储 %s", s_buf_space);
     v->about_lines = 4;
 
@@ -813,18 +984,64 @@ static void view_book_info(mp_ui_state_t *v)
     v->meta.text = s_buf_info;
     v->meta.enc = MP_STR_UTF8;
 
-    snprintf(s_buf_info_act[0], sizeof(s_buf_info_act[0]), "%s", "跳转");
-    snprintf(s_buf_info_act[1], sizeof(s_buf_info_act[1]), "%s", "重置阅读进度");
-    snprintf(s_buf_info_act[2], sizeof(s_buf_info_act[2]), "%s", "返回书库");
-    snprintf(s_buf_info_act[3], sizeof(s_buf_info_act[3]), "%s", "删除本书");
+    snprintf(s_buf_info_act[0], sizeof(s_buf_info_act[0]), "%s", "目录");
+    snprintf(s_buf_info_act[1], sizeof(s_buf_info_act[1]), "%s", "跳转");
+    snprintf(s_buf_info_act[2], sizeof(s_buf_info_act[2]), "%s", "重置进度");
+    snprintf(s_buf_info_act[3], sizeof(s_buf_info_act[3]), "%s", "返回书库");
+    snprintf(s_buf_info_act[4], sizeof(s_buf_info_act[4]), "%s", "删除本书");
 
-    v->row_count = 4;
-    v->sel = mp_app_state.info_sel < 4 ? mp_app_state.info_sel : 0;
+    v->row_count = MP_INFO_ACT_ROWS;
+    v->sel = mp_app_state.info_sel < MP_INFO_ACT_ROWS ? mp_app_state.info_sel : 0;
     v->scroll = 0;
-    for (uint8_t i = 0; i < 4; i++) {
+    for (uint8_t i = 0; i < MP_INFO_ACT_ROWS; i++) {
         v->row[i].label = s_buf_info_act[i];
         v->row[i].enc = MP_STR_UTF8;
         v->row[i].kind = MP_ROW_TEXT;
+    }
+}
+
+static void view_toc_empty(mp_ui_state_t *v);
+
+static void view_toc(mp_ui_state_t *v)
+{
+    uint16_t count = mp_app_state.toc_count;
+    if (count == 0) {
+        view_toc_empty(v);
+        return;
+    }
+    uint16_t sel = mp_app_state.toc_sel;
+    if (sel >= count) {
+        sel = (uint16_t)(count - 1u);
+    }
+    uint16_t scroll = mp_ui_list_scroll(sel, count);
+
+    v->left.text = "目录";
+    v->left.enc = MP_STR_UTF8;
+    v->time_valid = 0;
+    snprintf(s_buf_mid, sizeof(s_buf_mid), "%u/%u",
+             (unsigned)(sel + 1u), (unsigned)count);
+    v->mid = s_buf_mid;
+    v->row_count = count;
+    v->sel = sel;
+    v->scroll = scroll;
+
+    if (!s_toc_win_valid || s_toc_win_scroll != scroll) {
+        int n = mp_toc_read_window(mp_app_state.book_idx, scroll,
+                                   MP_LIST_ROWS, s_toc_win);
+        s_toc_win_n = (n > 0) ? (uint8_t)n : 0;
+        s_toc_win_scroll = scroll;
+        s_toc_win_valid = (n >= 0) ? 1u : 0u;
+    }
+
+    for (uint8_t i = 0; i < MP_LIST_ROWS; i++) {
+        if (i < s_toc_win_n) {
+            v->row[i].label = s_toc_win[i].title;
+            v->row[i].enc = title_enc(s_toc_win[i].title);
+            v->row[i].kind = MP_ROW_TEXT;
+        } else {
+            v->row[i].label = NULL;
+            v->row[i].enc = MP_STR_UTF8;
+        }
     }
 }
 
@@ -898,6 +1115,11 @@ static void view_msg1(mp_ui_state_t *v, const char *title, const char *l1)
 static void view_empty(mp_ui_state_t *v)
 {
     view_msg2(v, "书库", "没有书", "用网页上传");
+}
+
+static void view_toc_empty(mp_ui_state_t *v)
+{
+    view_msg2(v, "目录", "未识别到章节", "可用进度跳转");
 }
 
 static void view_error(mp_ui_state_t *v)
@@ -1013,6 +1235,12 @@ bool mp_app_view(mp_ui_state_t *out)
         break;
     case MP_SCREEN_BOOK_INFO:
         view_book_info(out);
+        break;
+    case MP_SCREEN_TOC:
+        view_toc(out);
+        break;
+    case MP_SCREEN_TOC_EMPTY:
+        view_toc_empty(out);
         break;
     case MP_SCREEN_JUMP:
         view_jump(out);
@@ -1196,6 +1424,8 @@ static void go_screen(uint8_t screen, uint8_t force_full)
         read_time_flush(now);
     }
     mp_app_state.pending_ok = 0;      /* 任何切屏都取消待发的 OK 单击（§2.3） */
+    mp_app_state.charge_popup = 0;
+    mp_app_state.charge_popup_until_ms = 0;
     mp_app_state.screen = screen;
     read_time_flush(now);
     mark_dirty();
@@ -1213,6 +1443,10 @@ static void close_book(void)
     memset(&mp_app_state.page, 0, sizeof(mp_app_state.page));
     mp_app_state.char_pos = 0;
     mp_app_state.book_len = 0;
+    mp_app_state.toc_count = 0;
+    mp_app_state.toc_sel = 0;
+    s_toc_win_valid = 0;
+    s_toc_win_n = 0;
 }
 
 static uint32_t days_from_civil(uint16_t y, uint8_t m, uint8_t d);
@@ -1283,6 +1517,27 @@ static void wall_time_refresh_now(void)
     }
 }
 
+/* 将已校准的有效时间快照持久化到 /sdcard/mp/clock.bin，防止彻底掉电后归零回 1 月 1 日。
+ * force=true 用于刚对时立即落盘；force=false 用于锁屏/深睡前按 >=60 s 节流落盘。 */
+static void clock_snapshot_save(bool force)
+{
+    if (!mp_app_state.storage_ok || s_rtc.magic != MP_RTC_MAGIC ||
+        !s_rtc.clock_calibrated) {
+        return;
+    }
+    uint32_t ux = 0;
+    if (!wall_time_get(&ux, NULL)) {
+        return;
+    }
+    if (!force && s_clock_saved_unix != 0 && ux >= s_clock_saved_unix &&
+        (ux - s_clock_saved_unix) < 60u) {
+        return;
+    }
+    if (mp_clock_save(ux) == 0) {
+        s_clock_saved_unix = ux;
+    }
+}
+
 static void open_clock(uint8_t force_full)
 {
     if (mp_app_state.book_open) {
@@ -1349,7 +1604,7 @@ static void open_select(void)
 }
 
 /* 装载一本书（不切屏）。失败不改动当前状态，调用方决定显示什么。 */
-static int book_open_slot(uint8_t slot)
+static int book_open_slot(uint16_t slot)
 {
     mp_book_t b;
     mp_page_t tmp;
@@ -1410,7 +1665,7 @@ static int book_open_slot(uint8_t slot)
     return 0;
 }
 
-static void open_book_from_ui(uint8_t slot)
+static void open_book_from_ui(uint16_t slot)
 {
     if (book_open_slot(slot) != 0) {
         show_error_storage();
@@ -1550,7 +1805,7 @@ static void delete_commit(void)
     if (!mp_app_state.book_open) {
         return;
     }
-    uint8_t idx = mp_app_state.book_idx;
+    uint16_t idx = mp_app_state.book_idx;
 
     /* 先关书：close_book() 会 flush 进度；必须在删除前完成，否则会把刚被
      * mp_store_delete() 清掉的进度又写回该槽。 */
@@ -1572,19 +1827,111 @@ static void delete_commit(void)
     }
 }
 
+static void toc_open(void)
+{
+    if (!mp_app_state.book_open) {
+        return;
+    }
+    if (!mp_app_state.storage_ok) {
+        show_error_storage();
+        return;
+    }
+    uint16_t count = 0;
+    if (mp_toc_ensure(mp_app_state.book_idx, mp_app_state.book_len,
+                      s_book_enc, &count) != 0) {
+        show_error_storage();
+        return;
+    }
+    mp_app_state.toc_count = count;
+    s_toc_win_valid = 0;
+    s_toc_win_n = 0;
+    if (count == 0) {
+        mp_app_state.toc_sel = 0;
+        go_screen(MP_SCREEN_TOC_EMPTY, 0);
+        return;
+    }
+    mp_app_state.toc_sel =
+        mp_toc_find_for_pos(mp_app_state.book_idx, count, mp_app_state.char_pos);
+    go_screen(MP_SCREEN_TOC, 0);
+}
+
+static void toc_step(int delta)
+{
+    uint16_t count = mp_app_state.toc_count;
+    if (count == 0) {
+        return;
+    }
+    int cur = (int)mp_app_state.toc_sel;
+    int nxt;
+    if (delta == 1 || delta == -1) {
+        /* 短按单步：首尾循环，与书库/设置列表手势一致。 */
+        nxt = (cur + delta + (int)count) % (int)count;
+    } else {
+        /* 长按大步快翻：停在首/末章，防止翻过头回绕。 */
+        nxt = cur + delta;
+        if (nxt < 0) {
+            nxt = 0;
+        } else if (nxt >= (int)count) {
+            nxt = (int)count - 1;
+        }
+    }
+    if (nxt != cur) {
+        mp_app_state.toc_sel = (uint16_t)nxt;
+        page_commit();
+    }
+}
+
+static void toc_activate(void)
+{
+    if (!mp_app_state.book_open || mp_app_state.toc_count == 0) {
+        return;
+    }
+    uint16_t sel = mp_app_state.toc_sel;
+    if (sel >= mp_app_state.toc_count) {
+        sel = (uint16_t)(mp_app_state.toc_count - 1u);
+    }
+
+    mp_toc_entry_t ent;
+    if (s_toc_win_valid && sel >= s_toc_win_scroll &&
+        sel < (uint16_t)(s_toc_win_scroll + s_toc_win_n)) {
+        ent = s_toc_win[sel - s_toc_win_scroll];
+    } else if (mp_toc_read_entry(mp_app_state.book_idx, sel, &ent) != 0) {
+        show_error_storage();
+        return;
+    }
+
+    uint32_t target = ent.offset;
+    if (target >= mp_app_state.book_len) {
+        target = 0;
+    }
+    mp_app_state.char_pos = target;
+    if (measure_page(target) != 0) {
+        show_error_storage();
+        return;
+    }
+    mp_page_hist_reset();
+    mp_app_state.pos_dirty = 1;
+    mp_app_state.pos_dirty_ms = now_ms();
+    mp_app_flush_progress();
+    go_screen(MP_SCREEN_READ, 0);
+}
+
 static void info_activate(void)
 {
     switch (mp_app_state.info_sel) {
     case 0:
-        read_enter_jump();
+        toc_open();
         break;
     case 1:
-        read_reset_progress();
+        read_enter_jump();
         break;
     case 2:
-        read_exit(MP_SCREEN_SELECT);
+        read_reset_progress();
         break;
     case 3:
+        read_exit(MP_SCREEN_SELECT);
+        break;
+    case 4:
         delete_enter();
         break;
     default:
@@ -1595,7 +1942,8 @@ static void info_activate(void)
 static void info_step(int dir)
 {
     mp_app_state.info_sel =
-        (uint8_t)((mp_app_state.info_sel + dir + 4) % 4);
+        (uint8_t)((mp_app_state.info_sel + dir + MP_INFO_ACT_ROWS) %
+                  MP_INFO_ACT_ROWS);
     page_commit();
 }
 
@@ -1755,19 +2103,26 @@ static void lock_enter(void)
         upload_abort();
     }
     mp_app_state.bl_popup = 0;
+    mp_app_state.charge_popup = 0;
+    mp_app_state.charge_popup_until_ms = 0;
     mp_app_state.prev_screen = mp_app_state.screen;
     mp_app_state.locked_from_read =
         (mp_app_state.screen == MP_SCREEN_READ ||
          mp_app_state.screen == MP_SCREEN_BOOK_INFO ||
+         mp_app_state.screen == MP_SCREEN_TOC ||
+         mp_app_state.screen == MP_SCREEN_TOC_EMPTY ||
          mp_app_state.screen == MP_SCREEN_JUMP) ? 1 : 0;
     mp_app_state.lock_prompt = 0;
     mp_app_state.lock_prompt_until_ms = 0;
     mp_app_state.pending_ok = 0;
     mp_app_state.lock_enter_ms = now;
+    s_lock_ok_down = 0;
+    s_lock_ok_down_ms = 0;
     mp_app_state.ble_off_ms = 0;
     clear_restore_arm();
 
     mp_app_flush_progress();          /* §6.4 时机 3：锁屏（scene_commit 之前） */
+    clock_snapshot_save(false);       /* 锁屏前按需更新 SD 时间快照，防意外断电归零 */
     if (mp_app_state.has_backlight) {
         mp_backlight_suspend();       /* 锁屏关闭背光待机省电 */
     }
@@ -1800,6 +2155,8 @@ static void unlock(uint32_t now)
     if (mp_app_state.screen != MP_SCREEN_LOCK) {
         return;
     }
+    s_lock_ok_down = 0;
+    s_lock_ok_down_ms = 0;
     mp_app_state.lock_prompt = 0;
     mp_app_state.lock_prompt_until_ms = 0;
     mp_app_state.pending_ok = 0;
@@ -1851,9 +2208,11 @@ static void restore_enter(void)
 
     if (mp_app_state.uploading) {
         /* 提交前不留任何写会话（mp_store_sync_close() 的语义在这里用 abort 代替）。 */
-        mp_store_abort(s_up_slot);
+        if (s_up_kind == UP_BOOK && s_up_slot < MP_MAX_SLOTS) {
+            mp_store_abort(s_up_slot);
+        }
         s_up_kind = UP_NONE;
-        s_up_slot = 0xFF;
+        s_up_slot = MP_SLOT_INVALID;
         mp_app_state.uploading = 0;
         mp_ble_set_upload_active(0);
     }
@@ -1961,7 +2320,7 @@ static void retry_action(void)
  * 列表 / 设置动作
  * ------------------------------------------------------------------ */
 
-static void cursor_step(uint8_t *sel, uint8_t count, int dir)
+static void cursor_step(uint16_t *sel, uint16_t count, int dir)
 {
     if (count == 0) {
         return;
@@ -1972,7 +2331,7 @@ static void cursor_step(uint8_t *sel, uint8_t count, int dir)
     } else if (s >= (int)count) {
         s = 0;
     }
-    *sel = (uint8_t)s;
+    *sel = (uint16_t)s;
 }
 
 static void select_activate(void)
@@ -2043,6 +2402,8 @@ static void bl_popup_open(void)
     mp_app_state.bl_saved_level = lv;
     mp_app_state.bl_edit_level = lv;
     mp_app_state.bl_popup = 1;
+    mp_app_state.charge_popup = 0;
+    mp_app_state.charge_popup_until_ms = 0;
     mp_app_state.pending_ok = 0;
     page_commit();
 }
@@ -2221,6 +2582,12 @@ static void ok_single_action(uint32_t now)
     case MP_SCREEN_BOOK_INFO:
         info_activate();
         break;
+    case MP_SCREEN_TOC:
+        toc_activate();
+        break;
+    case MP_SCREEN_TOC_EMPTY:
+        read_enter_jump();
+        break;
     case MP_SCREEN_JUMP:
         jump_apply();
         break;
@@ -2271,6 +2638,7 @@ static void on_ok_click(uint32_t now)
 
 static void on_ok_long(uint32_t now)
 {
+    (void)now;
     mp_app_state.pending_ok = 0;      /* 长按优先（§2.3） */
 
     if (mp_app_state.screen == MP_SCREEN_RESTORE) {
@@ -2281,7 +2649,7 @@ static void on_ok_long(uint32_t now)
         return;
     }
     if (mp_app_state.screen == MP_SCREEN_LOCK) {
-        unlock(now);
+        /* 浅锁屏统一要求持续按住 ○ 键满 2 秒才解锁（无需松手），由 poll_lock_unlock 接管。 */
         return;
     }
     if (mp_app_state.screen == MP_SCREEN_DELETE) {
@@ -2366,6 +2734,26 @@ static void on_click(uint8_t key, uint32_t now)
             info_step(1);
         } else if (key == MP_KEY_CANCEL) {
             go_screen(MP_SCREEN_READ, 0);
+        } else if (key == MP_KEY_MENU) {
+            manual_full();
+        }
+        break;
+
+    case MP_SCREEN_TOC:
+        if (key == MP_KEY_LEFT) {
+            toc_step(-1);
+        } else if (key == MP_KEY_RIGHT) {
+            toc_step(1);
+        } else if (key == MP_KEY_CANCEL) {
+            go_screen(MP_SCREEN_BOOK_INFO, 0);
+        } else if (key == MP_KEY_MENU) {
+            manual_full();
+        }
+        break;
+
+    case MP_SCREEN_TOC_EMPTY:
+        if (key == MP_KEY_CANCEL) {
+            go_screen(MP_SCREEN_BOOK_INFO, 0);
         } else if (key == MP_KEY_MENU) {
             manual_full();
         }
@@ -2516,6 +2904,25 @@ static void on_long(uint8_t key, uint32_t now)
         }
         break;
 
+    case MP_SCREEN_TOC:
+        if (key == MP_KEY_LEFT || key == MP_KEY_RIGHT) {
+            int step = (mp_app_state.toc_count > 40u) ? 10 : 4;
+            toc_step(key == MP_KEY_LEFT ? -step : step);
+        } else if (key == MP_KEY_CANCEL) {
+            go_screen(MP_SCREEN_READ, 0);
+        } else if (key == MP_KEY_MENU) {
+            bl_popup_open();
+        }
+        break;
+
+    case MP_SCREEN_TOC_EMPTY:
+        if (key == MP_KEY_CANCEL) {
+            go_screen(MP_SCREEN_READ, 0);
+        } else if (key == MP_KEY_MENU) {
+            bl_popup_open();
+        }
+        break;
+
     case MP_SCREEN_JUMP:
         if (key == MP_KEY_CANCEL) {
             go_screen(MP_SCREEN_BOOK_INFO, 0);
@@ -2573,6 +2980,56 @@ static void on_long(uint8_t key, uint32_t now)
     }
 }
 
+static void mp_app_key_dispatch(uint8_t key, uint8_t ev, uint32_t now)
+{
+    /* 到期的 OK 单击先补发，保证"两次 CLICK 间隔 >350 ms"= 两次单击。 */
+    poll_pending_ok(now);
+
+    if (ev == KEY_EV_DOWN) {
+        if (key == MP_KEY_OK) {
+            /* armed 之后必须见到新的 OK DOWN 才认 LONG（§8.3）；
+             * 不清 pending_ok——§2.3 的冻结算法只在 CLICK 上判双击。 */
+            if (mp_app_state.restore_armed) {
+                mp_app_state.restore_key_ok = 1;
+            }
+            if (mp_app_state.screen == MP_SCREEN_LOCK) {
+                s_lock_ok_down = 1;
+                s_lock_ok_down_ms = now;
+            }
+        } else {
+            /* 别的键按下就把待发的 OK 单击与锁屏长按计数作废（§2.1）。 */
+            mp_app_state.pending_ok = 0;
+            s_lock_ok_down = 0;
+        }
+        if (mp_app_state.screen == MP_SCREEN_RESTORE && key != MP_KEY_OK) {
+            mp_app_state.restore_key_ok = 0;
+        }
+        return;
+    }
+
+    if (key == MP_KEY_OK) {
+        if (ev == KEY_EV_LONG) {
+            on_ok_long(now);
+        } else if (ev == KEY_EV_CLICK) {
+            s_lock_ok_down = 0;
+            if (mp_app_state.screen == MP_SCREEN_RESTORE) {
+                return;               /* 确认页 OK 短按无动作 */
+            }
+            on_ok_click(now);
+        }
+        return;
+    }
+
+    /* 非 OK 键：CLICK / LONG 都立刻取消待发的 OK 单击（§2.3）。 */
+    mp_app_state.pending_ok = 0;
+    s_lock_ok_down = 0;
+    if (ev == KEY_EV_CLICK) {
+        on_click(key, now);
+    } else if (ev == KEY_EV_LONG) {
+        on_long(key, now);
+    }
+}
+
 void mp_app_key(uint8_t key, uint8_t ev, uint32_t now_ms_in)
 {
     uint32_t now = now_ms_in;
@@ -2591,6 +3048,10 @@ void mp_app_key(uint8_t key, uint8_t ev, uint32_t now_ms_in)
         if (key == MP_KEY_CANCEL && ev == KEY_EV_LONG) {
             debug_exit();
         }
+        return;
+    }
+    if (s_up_kind == UP_OTA) {
+        /* 蓝牙固件更新期间屏蔽物理按键，避免误锁屏或中断刷写流程（设备端不切屏）。 */
         return;
     }
 
@@ -2616,44 +3077,21 @@ void mp_app_key(uint8_t key, uint8_t ev, uint32_t now_ms_in)
         }
     }
 
-    /* 到期的 OK 单击先补发，保证"两次 CLICK 间隔 >350 ms"= 两次单击。 */
-    poll_pending_ok(now);
-
-    if (ev == KEY_EV_DOWN) {
-        if (key == MP_KEY_OK) {
-            /* armed 之后必须见到新的 OK DOWN 才认 LONG（§8.3）；
-             * 不清 pending_ok——§2.3 的冻结算法只在 CLICK 上判双击。 */
-            if (mp_app_state.restore_armed) {
-                mp_app_state.restore_key_ok = 1;
-            }
-        } else {
-            /* 别的键按下就把待发的 OK 单击作废（§2.1）。 */
-            mp_app_state.pending_ok = 0;
-        }
-        if (mp_app_state.screen == MP_SCREEN_RESTORE && key != MP_KEY_OK) {
-            mp_app_state.restore_key_ok = 0;
-        }
-        return;
+    uint8_t dismiss_charge = 0;
+    uint32_t prev_frames = 0;
+    if (mp_app_state.charge_popup && ev != KEY_EV_DOWN) {
+        /* 充电提示浮窗展示期间按键：直接收起浮窗并照常响应本次按键动作。 */
+        dismiss_charge = 1;
+        prev_frames = frames_now();
+        mp_app_state.charge_popup = 0;
+        mp_app_state.charge_popup_until_ms = 0;
     }
 
-    if (key == MP_KEY_OK) {
-        if (ev == KEY_EV_LONG) {
-            on_ok_long(now);
-        } else if (ev == KEY_EV_CLICK) {
-            if (mp_app_state.screen == MP_SCREEN_RESTORE) {
-                return;               /* 确认页 OK 短按无动作 */
-            }
-            on_ok_click(now);
-        }
-        return;
-    }
+    mp_app_key_dispatch(key, ev, now);
 
-    /* 非 OK 键：CLICK / LONG 都立刻取消待发的 OK 单击（§2.3）。 */
-    mp_app_state.pending_ok = 0;
-    if (ev == KEY_EV_CLICK) {
-        on_click(key, now);
-    } else if (ev == KEY_EV_LONG) {
-        on_long(key, now);
+    if (dismiss_charge && !mp_app_state.charge_popup &&
+        !mp_app_state.bl_popup && !s_dirty && frames_now() == prev_frames) {
+        page_commit();
     }
 }
 
@@ -2664,7 +3102,7 @@ void mp_app_key(uint8_t key, uint8_t ev, uint32_t now_ms_in)
 static void upload_end_session(void)
 {
     s_up_kind = UP_NONE;
-    s_up_slot = 0xFF;
+    s_up_slot = MP_SLOT_INVALID;
     s_up_written = 0;
     s_up_total = 0;
     s_up_notified = 0;
@@ -2677,13 +3115,28 @@ static void upload_end_session(void)
 
 static void upload_abort(void)
 {
-    if (s_up_kind == UP_BOOK && s_up_slot < MP_MAX_BOOKS) {
+    uint8_t kind = s_up_kind;
+    if (kind == UP_BOOK && s_up_slot < MP_MAX_SLOTS) {
         mp_store_abort(s_up_slot);
+    } else if (kind == UP_OTA) {
+        mp_ota_abort();
     }
     /* font / lock 没有 abort API：下次 begin 会重建文件。 */
-    ESP_LOGW(TAG, "upload aborted at %u/%u", (unsigned)s_up_written,
-             (unsigned)s_up_total);
+    ESP_LOGW(TAG, "upload aborted (kind=%u) at %u/%u", (unsigned)kind,
+             (unsigned)s_up_written, (unsigned)s_up_total);
     upload_end_session();
+}
+
+/* 解析 1 B（旧客户端 0..254）或 2 B 小端（新客户端 0..MP_MAX_SLOTS-1）槽号。 */
+static uint16_t parse_slot_req(const mp_ble_req_t *req)
+{
+    if (!req || req->len < 1) {
+        return MP_SLOT_INVALID;
+    }
+    if (req->len >= 2) {
+        return (uint16_t)req->data[0] | ((uint16_t)req->data[1] << 8);
+    }
+    return (uint16_t)req->data[0];
 }
 
 static void notify_u24(uint8_t op, uint32_t v)
@@ -2709,26 +3162,40 @@ static void reply_st(uint8_t op, uint8_t st)
     (void)mp_ble_notify(p, 2);
 }
 
-static void reply_st_idx(uint8_t op, uint8_t st, uint8_t idx)
+static void reply_begin(uint8_t st, uint16_t slot)
 {
-    /* 0x10 的应答是 [op][st][slot]。 */
-    uint8_t p[3] = {op, st, idx};
-    (void)mp_ble_notify(p, 3);
+    /* 0x10 应答扩展为 4 B：[0x10][st][slot_lo][slot_hi]。
+     * 旧客户端只读前 3 B（slot < 255 时 slot_hi=0，失败时 0xFF/0xFF），完全向下兼容。 */
+    uint8_t p[4] = {
+        MP_OP_BOOK_BEGIN,
+        st,
+        (uint8_t)(slot & 0xFFu),
+        (uint8_t)((slot >> 8) & 0xFFu),
+    };
+    (void)mp_ble_notify(p, sizeof(p));
 }
 
-/* 0x10 的失败应答也必须是 3 字节（PORT_SPEC §7.3）：原版 web 只在
- * b.length >= 3 时 resolve，2 字节会被当成不匹配、主机耗尽 5 s 超时，
- * 看不到 0x01/0x02/0xFD/0xFE 的具体状态。 */
 static void reply_begin_fail(uint8_t st)
 {
-    reply_st_idx(MP_OP_BOOK_BEGIN, st, 0xFF);
+    reply_begin(st, MP_SLOT_INVALID);
 }
 
-static void reply_get_fail(uint8_t idx)
+static void reply_get_fail(uint16_t idx)
 {
-    /* 0x15 的失败应答是 [0x15][idx][0xFF]（索引在前，与 0x10 相反）。 */
-    uint8_t p[3] = {MP_OP_BOOK_GET, idx, MP_ST_FAIL};
-    (void)mp_ble_notify(p, 3);
+    /* 0x15 的失败应答：idx < 255 或无效槽保持 3 B [0x15][idx_lo][0xFF] 兼容旧客户端；
+     * idx >= 255 时追加第 4 字节 idx_hi。 */
+    if (idx >= 255u && idx < MP_SLOT_INVALID) {
+        uint8_t p[4] = {
+            MP_OP_BOOK_GET,
+            (uint8_t)(idx & 0xFFu),
+            MP_ST_FAIL,
+            (uint8_t)((idx >> 8) & 0xFFu),
+        };
+        (void)mp_ble_notify(p, sizeof(p));
+    } else {
+        uint8_t p[3] = {MP_OP_BOOK_GET, (uint8_t)(idx & 0xFFu), MP_ST_FAIL};
+        (void)mp_ble_notify(p, sizeof(p));
+    }
 }
 
 /* 锁屏下被拒绝的 op：按各自的应答形状回失败，主机不会空等超时。 */
@@ -2743,10 +3210,16 @@ static void reply_locked_reject(uint8_t op)
         notify_u24(op, 0);               /* “无会话”语义：written=0 */
         break;
     case MP_OP_BOOK_END: {
-        uint8_t p[6] = {MP_OP_BOOK_END, MP_ST_FAIL, 0xFF, 0, 0, 0};
+        uint8_t p[7] = {MP_OP_BOOK_END, MP_ST_FAIL, 0xFF, 0, 0, 0, 0xFF};
         (void)mp_ble_notify(p, sizeof(p));
         break;
     }
+    case MP_OP_OTA_BEGIN:
+    case MP_OP_OTA_DATA:
+    case MP_OP_OTA_END:
+    case MP_OP_OTA_ABORT:
+        reply_st(op, MP_ST_OTA_LOCKED);
+        break;
     default:
         reply_st(op, MP_ST_FAIL);
         break;
@@ -2791,12 +3264,7 @@ static void ble_book_begin(const mp_ble_req_t *req)
         return;
     }
 
-    int slot = mp_store_find_free_slot();
-    if (slot < 0) {
-        reply_begin_fail(MP_ST_SLOTS_FULL);
-        return;
-    }
-
+    /* 先做可用空间门控，避免空间不足时无谓扩容目录表。 */
     uint64_t total_b = 0;
     uint64_t free_b = 0;
     if (store_space(&total_b, &free_b) == 0) {
@@ -2804,6 +3272,12 @@ static void ble_book_begin(const mp_ble_req_t *req)
             reply_begin_fail(MP_ST_NO_SPACE);
             return;
         }
+    }
+
+    int32_t slot = mp_store_find_free_slot();
+    if (slot < 0) {
+        reply_begin_fail(MP_ST_SLOTS_FULL);
+        return;
     }
 
     /* 标题截到 19 B，且不切断双字节（§6.6-10）。 */
@@ -2817,14 +3291,14 @@ static void ble_book_begin(const mp_ble_req_t *req)
     memcpy(title, &d[1], take);
     title[take] = '\0';
 
-    if (mp_store_begin((uint8_t)slot, title, total,
+    if (mp_store_begin((uint16_t)slot, title, total,
                        enc == MP_ENC_GB2312 ? MP_ENC_GB2312 : MP_ENC_ASCII) != 0) {
         reply_begin_fail(MP_ST_FAIL);
         return;
     }
 
     s_up_kind = UP_BOOK;
-    s_up_slot = (uint8_t)slot;
+    s_up_slot = (uint16_t)slot;
     s_up_written = 0;
     s_up_total = total;
     s_up_notified = 0;
@@ -2836,7 +3310,7 @@ static void ble_book_begin(const mp_ble_req_t *req)
     upload_pm_acquire();
     mp_ble_set_upload_active(1);
 
-    reply_st_idx(MP_OP_BOOK_BEGIN, MP_ST_OK, (uint8_t)slot);
+    reply_begin(MP_ST_OK, (uint16_t)slot);
     ESP_LOGI(TAG, "book begin slot=%u len=%u", (unsigned)slot, (unsigned)total);
 }
 
@@ -2906,16 +3380,18 @@ static void ble_data_chunk(const mp_ble_req_t *req, uint8_t kind)
 
 static void ble_book_end(void)
 {
-    uint8_t out[6] = {MP_OP_BOOK_END, MP_ST_FAIL, 0xFF, 0, 0, 0};
+    /* 0x12 应答：前 6 B 保持原协议，末尾追加第 7 字节 slot_hi 兼容 16-bit 槽号。 */
+    uint8_t out[7] = {MP_OP_BOOK_END, MP_ST_FAIL, 0xFF, 0, 0, 0, 0xFF};
 
     if (s_up_kind != UP_BOOK) {
         (void)mp_ble_notify(out, sizeof(out));
         return;
     }
-    out[2] = s_up_slot;
+    out[2] = (uint8_t)(s_up_slot & 0xFFu);
     out[3] = (uint8_t)((s_up_written >> 16) & 0xFF);
     out[4] = (uint8_t)((s_up_written >> 8) & 0xFF);
     out[5] = (uint8_t)(s_up_written & 0xFF);
+    out[6] = (uint8_t)((s_up_slot >> 8) & 0xFFu);
 
     if (s_up_written != s_up_total) {
         ESP_LOGW(TAG, "book end short: %u/%u", (unsigned)s_up_written,
@@ -2926,7 +3402,7 @@ static void ble_book_end(void)
         return;
     }
 
-    uint8_t idx = s_up_slot;
+    uint16_t idx = s_up_slot;
     if (s_up_gbk_lead) {
         s_up_chars++;                 /* 文件末尾落单的 GB2312 lead */
         s_up_gbk_lead = 0;
@@ -2952,8 +3428,8 @@ static void ble_book_end(void)
 
 static void ble_book_delete(const mp_ble_req_t *req)
 {
-    uint8_t idx = req->len >= 1 ? req->data[0] : 0xFF;
-    if (req->len < 1 || idx >= MP_MAX_BOOKS) {
+    uint16_t idx = parse_slot_req(req);
+    if (idx >= MP_MAX_SLOTS) {
         reply_st(MP_OP_BOOK_DELETE, MP_ST_FAIL);
         return;
     }
@@ -2967,10 +3443,16 @@ static void ble_book_delete(const mp_ble_req_t *req)
     }
 
     if (mp_app_state.book_open && mp_app_state.book_idx == idx) {
-        uint8_t was_read = (mp_app_state.screen == MP_SCREEN_READ) ? 1 : 0;
+        uint8_t in_book =
+            (mp_app_state.screen == MP_SCREEN_READ ||
+             mp_app_state.screen == MP_SCREEN_BOOK_INFO ||
+             mp_app_state.screen == MP_SCREEN_TOC ||
+             mp_app_state.screen == MP_SCREEN_TOC_EMPTY ||
+             mp_app_state.screen == MP_SCREEN_JUMP ||
+             mp_app_state.screen == MP_SCREEN_DELETE) ? 1 : 0;
         mp_app_flush_progress();
         close_book();
-        if (was_read) {
+        if (in_book) {
             go_screen(MP_SCREEN_CLOCK, 1);   /* §7.4：先回 CLOCK 再删 */
         }
     }
@@ -2987,7 +3469,7 @@ static void ble_book_delete(const mp_ble_req_t *req)
             go_screen(MP_SCREEN_EMPTY, 0);   /* 空列表进 EMPTY（§9.5） */
         } else {
             if (mp_app_state.sel >= s_done_n) {
-                mp_app_state.sel = (uint8_t)(s_done_n - 1);
+                mp_app_state.sel = (uint16_t)(s_done_n - 1u);
             }
             page_commit();
         }
@@ -2997,11 +3479,11 @@ static void ble_book_delete(const mp_ble_req_t *req)
 
 static void ble_book_get(const mp_ble_req_t *req)
 {
-    uint8_t idx = req->len >= 1 ? req->data[0] : 0xFF;
+    uint16_t idx = parse_slot_req(req);
     mp_book_t b;
 
     memset(&b, 0, sizeof(b));   /* entry_title() 只写到首个 NUL：其余字节必须先清零 */
-    if (req->len < 1 || idx >= MP_MAX_BOOKS) {
+    if (idx >= MP_MAX_SLOTS) {
         reply_get_fail(idx);
         return;
     }
@@ -3011,42 +3493,49 @@ static void ble_book_get(const mp_ble_req_t *req)
         return;
     }
 
-    uint8_t p1[15];
-    uint8_t p2[11];
-    uint8_t p3[7];
+    uint8_t p1[16];
+    uint8_t p2[12];
+    uint8_t p3[8];
+    uint8_t ext = (idx >= 255u) ? 1u : 0u;
+    uint8_t idx_lo = (uint8_t)(idx & 0xFFu);
+    uint8_t idx_hi = (uint8_t)((idx >> 8) & 0xFFu);
     memset(p1, 0, sizeof(p1));
     memset(p2, 0, sizeof(p2));
     memset(p3, 0, sizeof(p3));
     p1[0] = MP_OP_BOOK_GET;
-    p1[1] = idx;
+    p1[1] = idx_lo;
     p1[2] = 0x00;
     memcpy(&p1[3], b.title, 12);
+    p1[15] = idx_hi;
     p2[0] = MP_OP_BOOK_GET;
-    p2[1] = idx;
+    p2[1] = idx_lo;
     p2[2] = 0x01;
     memcpy(&p2[3], &b.title[12], 8);
+    p2[11] = idx_hi;
     p3[0] = MP_OP_BOOK_GET;
-    p3[1] = idx;
+    p3[1] = idx_lo;
     p3[2] = 0x02;
     p3[3] = (uint8_t)((b.len >> 16) & 0xFF);
     p3[4] = (uint8_t)((b.len >> 8) & 0xFF);
     p3[5] = (uint8_t)(b.len & 0xFF);
     p3[6] = b.enc == MP_ENC_GB2312 ? MP_ENC_GB2312 : MP_ENC_ASCII;
+    p3[7] = idx_hi;
 
-    (void)mp_ble_notify(p1, sizeof(p1));   /* 三条背靠背，不插延时 */
-    (void)mp_ble_notify(p2, sizeof(p2));
-    (void)mp_ble_notify(p3, sizeof(p3));
+    (void)mp_ble_notify(p1, ext ? 16u : 15u);   /* 三条背靠背，不插延时 */
+    (void)mp_ble_notify(p2, ext ? 12u : 11u);
+    (void)mp_ble_notify(p3, ext ? 8u : 7u);
 }
 
 static void ble_status(void)
 {
     uint16_t mtu = mp_ble_mtu();
+    uint16_t cnt = mp_app_state.storage_ok ? mp_store_count_done() : 0u;
     uint8_t p[5];
     p[0] = MP_OP_STATUS;
     /* 内嵌 HZK16 永远可渲染，font_ok 不依赖 SD 是否挂载（PROTOCOL 0x19）。 */
     p[1] = mp_store_font_ok() ? 1 : 0;
-    /* book_cnt 永远是真实 DONE 数（§7.3：不用 0xFF 表示异常）。 */
-    p[2] = mp_app_state.storage_ok ? (uint8_t)mp_store_count_done() : 0;
+    /* book_cnt 饱和到 255 保持 5 B 旧格式，真实总数由 0x14 扩展字段给出。 */
+    p[2] = cnt > 255u ? 255u : (uint8_t)cnt;
     p[3] = mp_store_lock_valid() ? 1 : 0;
     p[4] = mtu > 255 ? 255 : (uint8_t)mtu;
     (void)mp_ble_notify(p, sizeof(p));
@@ -3071,7 +3560,7 @@ static void ble_font_begin(const mp_ble_req_t *req)
         return;
     }
     s_up_kind = UP_FONT;
-    s_up_slot = 0xFF;
+    s_up_slot = MP_SLOT_INVALID;
     s_up_written = 0;
     s_up_total = total;
     s_up_notified = 0;
@@ -3121,7 +3610,7 @@ static void ble_lock_begin(const mp_ble_req_t *req)
         return;
     }
     s_up_kind = UP_LOCK;
-    s_up_slot = 0xFF;
+    s_up_slot = MP_SLOT_INVALID;
     s_up_written = 0;
     s_up_total = total;
     s_up_notified = 0;
@@ -3268,6 +3757,8 @@ static void apply_time(uint32_t unix_s, uint16_t year, uint8_t month, uint8_t da
     esp_sync_timekeeping_timers();
     s_rtc.magic = MP_RTC_MAGIC;
     s_rtc.time_synced = 1;
+    s_rtc.clock_calibrated = 1;
+    clock_snapshot_save(true);
 
     if (mp_app_state.screen == MP_SCREEN_CLOCK) {
         page_commit();
@@ -3284,6 +3775,216 @@ static void ble_set_time(const mp_ble_req_t *req)
                       ((uint32_t)d[2] << 8) | (uint32_t)d[3];
     uint16_t year = (uint16_t)(((uint16_t)d[4] << 8) | d[5]);
     apply_time(unix_s, year, d[6], d[7], d[8], now_ms());
+}
+
+/* ------------------------------------------------------------------ *
+ * 蓝牙原地固件自更新（0x50..0x54，不动官方槽/分区表/Bootloader）
+ * ------------------------------------------------------------------ */
+
+static void notify_ota_progress(uint8_t st, uint32_t written)
+{
+    uint8_t p[6];
+    p[0] = MP_OP_OTA_DATA;
+    p[1] = st;
+    p[2] = (uint8_t)((written >> 24) & 0xFFu);
+    p[3] = (uint8_t)((written >> 16) & 0xFFu);
+    p[4] = (uint8_t)((written >> 8) & 0xFFu);
+    p[5] = (uint8_t)(written & 0xFFu);
+    (void)mp_ble_notify(p, sizeof(p));
+}
+
+static void ble_ota_info(void)
+{
+    mp_ota_info_t info;
+    mp_ota_get_info(&info);
+    const power_status_t *p = pw();
+
+    uint8_t flags = 0;
+    if (p->charging) {
+        flags |= 1u << 0;
+    }
+    if (info.stage_ok) {
+        flags |= 1u << 1;
+    }
+    if (info.other_is_stock) {
+        flags |= 1u << 2;
+    }
+    if (mp_app_state.screen == MP_SCREEN_LOCK) {
+        flags |= 1u << 3;
+    }
+    if (mp_app_state.has_backlight) {
+        flags |= 1u << 4;
+    }
+
+    uint8_t buf[128];
+    uint16_t pos = 0;
+    buf[pos++] = MP_OP_OTA_INFO;
+    buf[pos++] = MP_ST_OK;
+    buf[pos++] = MP_OTA_PROTO_VER;
+    buf[pos++] = (uint8_t)((info.max_size >> 24) & 0xFFu);
+    buf[pos++] = (uint8_t)((info.max_size >> 16) & 0xFFu);
+    buf[pos++] = (uint8_t)((info.max_size >> 8) & 0xFFu);
+    buf[pos++] = (uint8_t)(info.max_size & 0xFFu);
+    buf[pos++] = info.running_slot;
+    buf[pos++] = flags;
+    buf[pos++] = p->valid ? p->percent : 0xFFu;
+
+    /* 若对端尚未协商大 MTU（如默认 23 B），仅回前 10 B 基础头避免 notify 超长失败。 */
+    uint16_t mtu = mp_ble_mtu();
+    uint16_t max_payload = (mtu > 3u) ? (uint16_t)(mtu - 3u) : 20u;
+    size_t vlen = strnlen(info.version, 24u);
+    size_t plen = strnlen(info.project, 24u);
+    uint16_t full_len = (uint16_t)(pos + 32u + 1u + vlen + 1u + plen);
+    if (full_len <= max_payload && full_len <= sizeof(buf)) {
+        memcpy(&buf[pos], info.app_elf_sha256, 32u);
+        pos += 32u;
+        buf[pos++] = (uint8_t)vlen;
+        if (vlen > 0) {
+            memcpy(&buf[pos], info.version, vlen);
+            pos += (uint16_t)vlen;
+        }
+        buf[pos++] = (uint8_t)plen;
+        if (plen > 0) {
+            memcpy(&buf[pos], info.project, plen);
+            pos += (uint16_t)plen;
+        }
+    }
+    (void)mp_ble_notify(buf, pos);
+}
+
+static void ble_ota_begin(const mp_ble_req_t *req)
+{
+    if (req->len < 36u) {
+        reply_st(MP_OP_OTA_BEGIN, MP_ST_BAD_PARAM);
+        return;
+    }
+    if (mp_app_state.uploading || mp_app_state.debug_mode ||
+        mp_app_state.screen == MP_SCREEN_LOW_BATT) {
+        reply_st(MP_OP_OTA_BEGIN, MP_ST_BUSY);
+        return;
+    }
+
+    const uint8_t *d = req->data;
+    uint32_t total = ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) |
+                     ((uint32_t)d[2] << 8) | (uint32_t)d[3];
+    const uint8_t *sha256 = d + 4;
+
+    power_sample();
+    const power_status_t *p = pw();
+    uint8_t st = mp_ota_begin(total, sha256, p->percent, p->valid, p->charging);
+    if (st != MP_ST_OK) {
+        reply_st(MP_OP_OTA_BEGIN, st);
+        return;
+    }
+
+    /* 落盘阅读进度，保持当前界面不变（OTA 进度只在手机 App 展示）。 */
+    read_time_flush(now_ms());
+    mp_app_flush_progress();
+    mp_app_state.pending_ok = 0;
+
+    s_up_kind = UP_OTA;
+    s_up_slot = MP_SLOT_INVALID;
+    s_up_written = 0;
+    s_up_total = total;
+    s_up_notified = 0;
+    s_up_chars = 0;
+    s_up_gbk_lead = 0;
+    mp_app_state.uploading = 1;
+    mp_app_state.last_pkt_ms = now_ms();
+    upload_pm_acquire();
+    mp_ble_set_upload_active(1);
+
+    uint16_t mtu = mp_ble_mtu();
+    uint16_t chunk_max = (mtu > 7u) ? (uint16_t)(mtu - 7u) : 16u;
+    if (chunk_max > (uint16_t)(MP_BLE_DATA_MAX - 3u)) {
+        chunk_max = (uint16_t)(MP_BLE_DATA_MAX - 3u);
+    }
+    const uint16_t window_bytes = 4096u;
+    uint8_t rsp[6] = {
+        MP_OP_OTA_BEGIN,
+        MP_ST_OK,
+        (uint8_t)(chunk_max >> 8),
+        (uint8_t)(chunk_max & 0xFFu),
+        (uint8_t)(window_bytes >> 8),
+        (uint8_t)(window_bytes & 0xFFu),
+    };
+    (void)mp_ble_notify(rsp, sizeof(rsp));
+}
+
+static void ble_ota_data(const mp_ble_req_t *req)
+{
+    if (s_up_kind != UP_OTA) {
+        notify_ota_progress(MP_ST_FAIL, 0);
+        return;
+    }
+    if (req->len < 4u) {
+        notify_ota_progress(MP_ST_BAD_PARAM, s_up_written);
+        return;
+    }
+    const uint8_t *d = req->data;
+    uint32_t off = ((uint32_t)d[0] << 16) | ((uint32_t)d[1] << 8) | (uint32_t)d[2];
+    size_t n = (size_t)(req->len - 3u);
+
+    uint32_t prev_written = s_up_written;
+    uint32_t written = s_up_written;
+    uint8_t st = mp_ota_write(off, d + 3, n, &written);
+    s_up_written = written;
+    mp_app_state.last_pkt_ms = now_ms();
+
+    if (st != MP_ST_OK) {
+        notify_ota_progress(st, written);
+        if (st == MP_ST_OTA_FLASH_ERR || st == MP_ST_BAD_PARAM) {
+            upload_abort();
+        }
+        return;
+    }
+
+    /* 每跨过 1 KiB、收到重复旧包或到达最后一字节时回报最新高水位。 */
+    bool dup_pkt = (written == prev_written);
+    if (dup_pkt || written == s_up_total ||
+        (written / 1024u) > (s_up_notified / 1024u)) {
+        s_up_notified = written;
+        notify_ota_progress(MP_ST_OK, written);
+    }
+}
+
+static void ble_ota_end(void)
+{
+    if (s_up_kind != UP_OTA) {
+        reply_st(MP_OP_OTA_END, MP_ST_FAIL);
+        return;
+    }
+
+    const power_status_t *p = pw();
+    uint8_t st = mp_ota_verify_staged(p->percent, p->valid, p->charging);
+    if (st != MP_ST_OK) {
+        reply_st(MP_OP_OTA_END, st);
+        upload_abort();
+        return;
+    }
+
+    /* 5 重校验全部通过：通知手机确认后直接关外设并执行纯 IRAM 自刷写与重启（不切屏）。 */
+    reply_st(MP_OP_OTA_END, MP_ST_OK);
+    vTaskDelay(pdMS_TO_TICKS(350));
+
+    mp_ble_stop();
+    display_sleep();
+    if (mp_app_state.has_backlight) {
+        mp_backlight_suspend();
+    }
+    storage_unmount();
+    esp_sync_timekeeping_timers();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    mp_ota_apply_and_reboot();
+}
+
+static void ble_ota_abort(void)
+{
+    if (s_up_kind == UP_OTA) {
+        upload_abort();
+    }
+    reply_st(MP_OP_OTA_ABORT, MP_ST_OK);
 }
 
 void mp_app_ble_req(const mp_ble_req_t *req)
@@ -3304,6 +4005,7 @@ void mp_app_ble_req(const mp_ble_req_t *req)
         case MP_OP_LOCK_READ:
         case MP_OP_SETTINGS_READ:
         case MP_OP_SETTINGS_WRITE:
+        case MP_OP_OTA_INFO:
             break;
         case MP_OP_EBOOK_CLOSE:
             mp_app_flush_progress();
@@ -3333,11 +4035,19 @@ void mp_app_ble_req(const mp_ble_req_t *req)
         ble_book_delete(req);
         break;
     case MP_OP_BOOK_COUNT: {
-        if (!mp_app_state.storage_ok) {
-            reply_st(MP_OP_BOOK_COUNT, 0);
-        } else {
-            reply_st(MP_OP_BOOK_COUNT, (uint8_t)mp_store_count_done());
-        }
+        /* 0x14 扩展为 6 B：[0x14][cnt_sat][done_lo][done_hi][cap_lo][cap_hi]。
+         * 旧客户端只读前 2 B，完全兼容；新客户端可获知真实总数与动态槽位上界。 */
+        uint16_t done = mp_app_state.storage_ok ? mp_store_count_done() : 0u;
+        uint16_t cap = mp_app_state.storage_ok ? mp_store_slot_capacity() : 0u;
+        uint8_t p[6] = {
+            MP_OP_BOOK_COUNT,
+            done > 255u ? 255u : (uint8_t)done,
+            (uint8_t)(done & 0xFFu),
+            (uint8_t)((done >> 8) & 0xFFu),
+            (uint8_t)(cap & 0xFFu),
+            (uint8_t)((cap >> 8) & 0xFFu),
+        };
+        (void)mp_ble_notify(p, sizeof(p));
         break;
     }
     case MP_OP_BOOK_GET:
@@ -3367,12 +4077,12 @@ void mp_app_ble_req(const mp_ble_req_t *req)
         }
         break;
     case MP_OP_EBOOK_OPEN: {
-        uint8_t idx = req->len >= 1 ? req->data[0] : 0xFF;
+        uint16_t idx = parse_slot_req(req);
         if (mp_app_state.debug_mode || mp_app_state.uploading) {
             reply_st(MP_OP_EBOOK_OPEN, MP_ST_BUSY);
             break;
         }
-        if (mp_app_state.storage_ok && idx < MP_MAX_BOOKS &&
+        if (mp_app_state.storage_ok && idx < MP_MAX_SLOTS &&
             book_open_slot(idx) == 0) {
             go_screen(MP_SCREEN_READ, 0);
             reply_st(MP_OP_EBOOK_OPEN, MP_ST_OK);
@@ -3443,6 +4153,21 @@ void mp_app_ble_req(const mp_ble_req_t *req)
     }
     case MP_OP_SET_TIME:
         ble_set_time(req);
+        break;
+    case MP_OP_OTA_INFO:
+        ble_ota_info();
+        break;
+    case MP_OP_OTA_BEGIN:
+        ble_ota_begin(req);
+        break;
+    case MP_OP_OTA_DATA:
+        ble_ota_data(req);
+        break;
+    case MP_OP_OTA_END:
+        ble_ota_end();
+        break;
+    case MP_OP_OTA_ABORT:
+        ble_ota_abort();
         break;
     default:
         break;
@@ -3532,6 +4257,7 @@ static void __attribute__((noreturn)) low_batt_shutdown(void)
     }
     read_time_flush(now_ms());
     mp_app_flush_progress();
+    clock_snapshot_save(true);
     s_rtc.deep_locked = 0;
     mp_ble_stop();
 
@@ -3543,7 +4269,7 @@ static void __attribute__((noreturn)) low_batt_shutdown(void)
     }
 
     display_sleep();
-    mp_backlight_suspend();
+    mp_backlight_deep_sleep();
     storage_unmount();
     sleep_hold_power_pins();
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -3565,6 +4291,8 @@ static uint8_t auto_lock_blocked(void)
     if (mp_app_state.screen == MP_SCREEN_LOCK ||
         mp_app_state.screen == MP_SCREEN_RESTORE ||
         mp_app_state.screen == MP_SCREEN_BOOK_INFO ||
+        mp_app_state.screen == MP_SCREEN_TOC ||
+        mp_app_state.screen == MP_SCREEN_TOC_EMPTY ||
         mp_app_state.screen == MP_SCREEN_JUMP ||
         mp_app_state.screen == MP_SCREEN_DELETE ||
         mp_app_state.screen == MP_SCREEN_TIME_SET ||
@@ -3573,7 +4301,8 @@ static uint8_t auto_lock_blocked(void)
         mp_app_state.screen == MP_SCREEN_LOW_BATT) {
         return 1;
     }
-    if (mp_app_state.debug_mode || mp_app_state.uploading) {
+    if (mp_app_state.debug_mode || mp_app_state.uploading ||
+        mp_app_state.charge_popup) {
         return 1;
     }
     if (mp_ble_connected()) {
@@ -3633,6 +4362,7 @@ static void ble_auto_off_check(uint32_t now)
 static uint8_t lock_deep_sleep_due(uint32_t now)
 {
     if (mp_app_state.screen != MP_SCREEN_LOCK || mp_app_state.lock_prompt ||
+        mp_app_state.charge_popup || s_lock_ok_down ||
         mp_app_state.uploading || mp_app_state.debug_mode ||
         mp_settings.ble_enabled || mp_ble_running() || mp_ble_connected()) {
         return 0;
@@ -3650,6 +4380,7 @@ static void __attribute__((noreturn)) lock_deep_sleep_enter(void)
 {
     read_time_flush(now_ms());
     mp_app_flush_progress();
+    clock_snapshot_save(false);
 
     s_rtc.magic = MP_RTC_MAGIC;
     s_rtc.deep_locked = 1;
@@ -3660,7 +4391,7 @@ static void __attribute__((noreturn)) lock_deep_sleep_enter(void)
     mp_ble_stop();
     display_sleep();
     if (mp_app_state.has_backlight) {
-        mp_backlight_suspend();
+        mp_backlight_deep_sleep();
     }
     storage_unmount();
     sleep_hold_power_pins();
@@ -3676,8 +4407,79 @@ static void __attribute__((noreturn)) lock_deep_sleep_enter(void)
     /* 进深睡前同步活跃期高精度时钟到硬件 RTC，消除唤醒跨小时/跨天走时偏移。 */
     esp_sync_timekeeping_timers();
 
-    ESP_LOGI(TAG, "enter lock deep sleep");
-    enter_ext1_deep_sleep(1ULL << BOARD_KEY_OK_GPIO);
+    uint64_t wake_mask = sleep_lock_wake_mask();
+    ESP_LOGI(TAG, "enter lock deep sleep (wake_mask=0x%llx)",
+             (unsigned long long)wake_mask);
+    enter_ext1_deep_sleep(wake_mask);
+}
+
+/* 消费 GPIO5 充电插拔跳变：插入弹出 5 秒充电提示并点亮状态栏小闪电，拔出立即消除。 */
+static void poll_charging(uint32_t now)
+{
+    (void)power_charge_poll(NULL);
+    const power_status_t *p = pw();
+    uint8_t chg = p->charging ? 1u : 0u;
+    if (chg == s_last_charging) {
+        return;
+    }
+    s_last_charging = chg;
+
+    if (!mp_app_state.uploading) {
+        power_sample();
+        p = pw();
+        if (p->valid) {
+            s_last_batt = p->percent;
+            s_batt_valid = 1;
+            if (mp_ble_running()) {
+                mp_ble_publish_battery(p->percent, p->mv);
+            }
+        }
+    }
+
+    if (chg) {
+        ESP_LOGI(TAG, "charger inserted (batt=%u%% valid=%u)",
+                 (unsigned)p->percent, (unsigned)p->valid);
+        if (!mp_app_state.uploading && !mp_app_state.debug_mode &&
+            mp_app_state.screen != MP_SCREEN_LOW_BATT) {
+            if (!mp_app_state.bl_popup) {
+                mp_app_state.charge_popup = 1;
+                uint32_t until = now + MP_CHARGE_POPUP_MS;
+                mp_app_state.charge_popup_until_ms = until ? until : 1u;
+            }
+            page_commit();
+        }
+    } else {
+        ESP_LOGI(TAG, "charger removed");
+        uint8_t had_popup = mp_app_state.charge_popup;
+        mp_app_state.charge_popup = 0;
+        mp_app_state.charge_popup_until_ms = 0;
+        if (!mp_app_state.uploading && !mp_app_state.debug_mode &&
+            mp_app_state.screen != MP_SCREEN_LOW_BATT &&
+            (mp_app_state.screen != MP_SCREEN_LOCK || had_popup)) {
+            page_commit();
+        }
+    }
+}
+
+/* 浅锁屏态轮询 ○ 键按住时长：持续按满 MP_LOCK_UNLOCK_MS (2 秒) 即刻唤醒，无需松手。 */
+static void poll_lock_unlock(uint32_t now)
+{
+    if (!s_lock_ok_down) {
+        return;
+    }
+    if (mp_app_state.screen != MP_SCREEN_LOCK) {
+        s_lock_ok_down = 0;
+        return;
+    }
+    if ((input_mask() & (1u << BOARD_KEY_OK_GPIO)) == 0u) {
+        s_lock_ok_down = 0;
+        lock_show_prompt(now);
+        return;
+    }
+    if ((uint32_t)(now - s_lock_ok_down_ms) >= MP_LOCK_UNLOCK_MS) {
+        s_lock_ok_down = 0;
+        unlock(now);
+    }
 }
 
 void mp_app_tick(uint32_t now)
@@ -3686,7 +4488,18 @@ void mp_app_tick(uint32_t now)
         return;
     }
 
+    poll_lock_unlock(now);
     poll_pending_ok(now);
+    poll_charging(now);
+
+    if (mp_app_state.charge_popup && mp_app_state.charge_popup_until_ms &&
+        (int32_t)(now - mp_app_state.charge_popup_until_ms) >= 0) {
+        mp_app_state.charge_popup = 0;
+        mp_app_state.charge_popup_until_ms = 0;
+        if (!mp_app_state.uploading && !mp_app_state.debug_mode) {
+            page_commit();
+        }
+    }
 
     if (mp_app_state.screen == MP_SCREEN_LOCK && mp_app_state.lock_prompt &&
         mp_app_state.lock_prompt_until_ms &&
@@ -3802,17 +4615,23 @@ void mp_app_boot(void)
     s_done_n = 0;
     s_error_kind = ERR_NONE;
     s_up_kind = UP_NONE;
-    s_up_slot = 0xFF;
+    s_up_slot = MP_SLOT_INVALID;
     s_batt_valid = 0;
     s_last_batt = 0;
+    s_last_charging = 0;
     s_stats_dirty = 0;
     s_read_ts_ms = 0;
     s_read_rem_ms = 0;
     s_read_tracking = 0;
+    s_toc_win_valid = 0;
+    s_toc_win_n = 0;
+    s_lock_ok_down = 0;
+    s_lock_ok_down_ms = 0;
 
     s_app_task = xTaskGetCurrentTaskHandle();
     input_set_wake_cb(app_wake);
     mp_ble_set_wake_cb(app_wake);
+    power_set_charge_wake_cb(app_wake);
 
 #ifdef CONFIG_PM_ENABLE
     if (!s_pm_cpu_lock) {
@@ -3850,8 +4669,16 @@ void mp_app_boot(void)
     s_book_chars_k = 0;
     s_year = MP_TIME_DEFAULT_YEAR;
     s_day_index = MP_TIME_DEFAULT_UNIX / 86400u;
+    s_clock_saved_unix = 0;
 
-    /* 若本周期内曾同步过时间，从跨深睡的 POSIX RTC 恢复最新走时基准。 */
+    /* 1) 存储先就绪：这样冷启动若硬件 RTC 因彻底掉电丢失，可从 /sdcard/mp/clock.bin 恢复。 */
+    ok = storage_sd_ok() ? 1 : 0;
+    if (ok) {
+        ok = mp_store_init() == 0 ? 1 : 0;
+    }
+    mp_app_state.storage_ok = ok;
+
+    /* 2) 墙钟恢复优先级：硬件 POSIX RTC（深睡一秒不差）> SD clock.bin（彻底断电兜底）> 默认值。 */
     uint32_t ux = 0;
     uint32_t ms = 0;
     if (s_rtc.magic == MP_RTC_MAGIC && s_rtc.time_synced &&
@@ -3860,22 +4687,30 @@ void mp_app_boot(void)
         mp_app_state.time_base_unix = ux;
         /* 保留亚秒毫秒偏移，避免深睡唤醒后整分钟边沿漂移。 */
         mp_app_state.time_base_ms = (boot_now >= ms) ? (boot_now - ms) : 0u;
+        if (s_rtc.clock_calibrated) {
+            s_clock_saved_unix = ux;
+        }
     } else {
-        /* 冷启动时也立即初始化系统 RTC，防止未手动对时前进入深睡归零停走。 */
-        struct timeval tv = {.tv_sec = (time_t)MP_TIME_DEFAULT_UNIX, .tv_usec = 0};
+        uint32_t init_ux = MP_TIME_DEFAULT_UNIX;
+        uint8_t restored_from_sd = 0;
+        if (ok && mp_clock_load(&ux) && ux >= MP_TIME_MIN_VALID_UNIX &&
+            ux < MP_TIME_MAX_VALID_UNIX) {
+            init_ux = ux;
+            restored_from_sd = 1;
+            ESP_LOGI(TAG, "clock restored from SD snapshot: unix=%u",
+                     (unsigned)init_ux);
+        }
+        (void)wall_time_sync_fields(init_ux);
+        mp_app_state.time_base_unix = init_ux;
+        mp_app_state.time_base_ms = boot_now;
+        struct timeval tv = {.tv_sec = (time_t)init_ux, .tv_usec = 0};
         (void)settimeofday(&tv, NULL);
         esp_sync_timekeeping_timers();
         s_rtc.magic = MP_RTC_MAGIC;
         s_rtc.time_synced = 1;
+        s_rtc.clock_calibrated = restored_from_sd;
+        s_clock_saved_unix = restored_from_sd ? init_ux : 0u;
     }
-
-    /* 存储：main.c 已按 §10.2 调过 storage_init()/mp_store_init()；这里再确认一次
-     * （mp_store_init 幂等），避免"目录没载入"被误判成空书库。 */
-    ok = storage_sd_ok() ? 1 : 0;
-    if (ok) {
-        ok = mp_store_init() == 0 ? 1 : 0;
-    }
-    mp_app_state.storage_ok = ok;
 
     if (!ok) {
         /* §6.7：存储坏也必须有一份有效设置（蓝牙开、锁屏 3 分钟、展示阅读数据、关背光、场景全刷、GC 10）。 */
@@ -3903,9 +4738,8 @@ void mp_app_boot(void)
             ? MP_LOCK_DISP_IMAGE
             : MP_LOCK_DISP_STATS;
 
-    /* 开机必须应用一次，否则用的是 reader_cfg.h 的 16 而不是用户设置（§5.4）。 */
-    display_set_gc((uint8_t)mp_gc_interval[mp_settings.gc_interval_idx],
-                   READER_GC_IDLE_MS);
+    /* 开机应用周期页内合并 GC 阈值（默认每 10 次局刷自动合并全刷，关闭空闲突袭全刷）。 */
+    display_set_gc((uint8_t)mp_gc_interval[mp_settings.gc_interval_idx], 0u);
     if (mp_ble_running()) {
         mp_ble_adv(mp_settings.ble_enabled);
     }
@@ -3915,6 +4749,7 @@ void mp_app_boot(void)
 
     power_sample();                   /* 首帧就要有电量 */
     const power_status_t *p = pw();
+    s_last_charging = p->charging ? 1u : 0u;
     if (low_batt_triggered(p)) {
         low_batt_shutdown();
     }
@@ -3949,6 +4784,14 @@ void mp_app_boot(void)
     }
 
     uint32_t ready_now = now_ms();
+    if (s_woke_charge) {
+        s_woke_charge = 0;
+        if (s_last_charging && mp_app_state.screen != MP_SCREEN_LOW_BATT) {
+            mp_app_state.charge_popup = 1;
+            uint32_t until = ready_now + MP_CHARGE_POPUP_MS;
+            mp_app_state.charge_popup_until_ms = until ? until : 1u;
+        }
+    }
     s_booted = 1;
     mp_app_state.last_input_ms = ready_now;
     ble_touch(ready_now);
@@ -4000,6 +4843,9 @@ static uint32_t app_next_wait_ms(uint32_t now)
         mp_app_state.lock_prompt_until_ms) {
         min_wait_until(&wait, now, mp_app_state.lock_prompt_until_ms);
     }
+    if (mp_app_state.charge_popup && mp_app_state.charge_popup_until_ms) {
+        min_wait_until(&wait, now, mp_app_state.charge_popup_until_ms);
+    }
     if (mp_app_state.uploading && wait > 500u) {
         wait = 500u;
     }
@@ -4039,7 +4885,11 @@ static uint32_t app_next_wait_ms(uint32_t now)
             min_wait_until(&wait, now, d);
         }
     }
+    if (mp_app_state.screen == MP_SCREEN_LOCK && s_lock_ok_down && wait > 50u) {
+        wait = 50u;
+    }
     if (mp_app_state.screen == MP_SCREEN_LOCK && !mp_app_state.lock_prompt &&
+        !mp_app_state.charge_popup && !s_lock_ok_down &&
         !mp_app_state.uploading && !mp_app_state.debug_mode &&
         !mp_settings.ble_enabled && !mp_ble_running() && !mp_ble_connected()) {
         if (mp_app_state.ble_off_ms != 0) {

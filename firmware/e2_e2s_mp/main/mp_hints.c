@@ -197,6 +197,11 @@ static const mp_hint_item_t HINT_EMPTY[] = {
     {1, {MP_HINT_MENU, MP_HINT_MENU}, NULL, TXT_BACK},
 };
 
+static const mp_hint_item_t HINT_TOC_EMPTY[] = {
+    {1, {MP_HINT_OK, MP_HINT_OK}, NULL, TXT_JUMP},
+    {1, {MP_HINT_MENU, MP_HINT_MENU}, NULL, TXT_BACK},
+};
+
 static const mp_hint_item_t HINT_ERROR[] = {
     {1, {MP_HINT_OK, MP_HINT_OK}, NULL, TXT_RETRY},
     {1, {MP_HINT_MENU, MP_HINT_MENU}, NULL, TXT_BACK},
@@ -232,7 +237,11 @@ uint8_t mp_hints_for(mp_screen_t screen, mp_hint_set_t *out)
         set_items(out, HINT_CLOCK, 2);
         break;
     case MP_SCREEN_SELECT:
+    case MP_SCREEN_TOC:
         set_items(out, HINT_SELECT, 3);
+        break;
+    case MP_SCREEN_TOC_EMPTY:
+        set_items(out, HINT_TOC_EMPTY, 2);
         break;
     case MP_SCREEN_SETTINGS:
         set_items(out, HINT_SETTINGS, 3);

@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "esp_app_desc.h"
 #include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -50,10 +51,11 @@ void app_main(void)
     /* 外设初始化前优先判断深睡唤醒长按防误触，短按误触立刻原样继续深睡。 */
     mp_app_early_wake_check();
 
-    /* Version / build only — never device identity (PORT_SPEC §0.2). */
-    ESP_LOGI(TAG, "miaopaper_e2_e2s %d.%d.%d  build %s %s  IDF %s  target %s",
-             READER_VERSION_MAJOR, READER_VERSION_MINOR, READER_VERSION_PATCH,
-             __DATE__, __TIME__, esp_get_idf_version(), CONFIG_IDF_TARGET);
+    /* 仅输出镜像头版本与构建日期，不输出任何设备身份信息（PORT_SPEC §0.2）。 */
+    const esp_app_desc_t *app = esp_app_get_description();
+    ESP_LOGI(TAG, "miaopaper_e2_e2s %s  build %s %s  IDF %s  target %s",
+             app->version, app->date, app->time,
+             esp_get_idf_version(), CONFIG_IDF_TARGET);
 
     /* PORT_SPEC §6.7: unconditional, and before mp_store_init()/mp_ble_start().
      * mp_settings is a zero-initialised global; when the SD fails to mount,

@@ -34,13 +34,19 @@
 #define MP_BLE_LOCK_OFF_MS 120000u
 #define MP_BLE_IDLE_OFF_MS 600000u
 
-/* 锁屏深睡：无蓝牙时锁屏满 10 s 进入深睡；唤醒需持续按住确认键 >= 500 ms 防误触。 */
+/* 锁屏解锁与深睡唤醒：浅锁屏与深睡锁屏统一要求按住确认键 ○ 满 2 秒即刻唤醒（无需松手）。
+ * 深睡冷启动 ROM+Bootloader 校验耗时约 300~350 ms，故 early_wake_check 内再持续确认
+ * MP_WAKE_HOLD_MS (1650 ms)，使用户总按住体感精确对齐 2.0 秒。 */
+#define MP_LOCK_UNLOCK_MS 2000u
 #define MP_LOCK_SLEEP_GRACE_MS 10000u
 #define MP_LOCK_SLEEP_AFTER_BLE_MS 2000u
-#define MP_WAKE_HOLD_MS 500u
+#define MP_WAKE_HOLD_MS 1650u
 
 /* 低电关机门限：未充电且电量 < 3% 时全刷空电池提示屏并进入 deep sleep。 */
 #define MP_LOW_BATT_SHUTDOWN_PCT 3u
+
+/* 插入充电器弹窗显示时长：5 秒后自动消失。 */
+#define MP_CHARGE_POPUP_MS 5000u
 
 /* 进度落盘节流：翻页只写 RAM，空闲满 2 s / 关书 / 锁屏 / MENU 才 fsync。 */
 #define MP_POS_FLUSH_MS 2000u
@@ -56,11 +62,15 @@ typedef struct {
     uint8_t bl_popup;               /* 1 = 叠加快捷背光调整浮窗 */
     uint8_t bl_edit_level;          /* 设置页/浮窗当前预览背光档位 0..3 */
     uint8_t bl_saved_level;         /* 进入背光页/浮窗前保存的原档位 */
+    uint8_t charge_popup;           /* 1 = 叠加插入充电器提示浮窗 */
+    uint32_t charge_popup_until_ms; /* 充电提示浮窗自动消失到期时刻 */
 
     /* 列表光标 */
-    uint8_t sel;                    /* SELECT */
+    uint16_t sel;                   /* SELECT */
     uint8_t set_sel;                /* SETTINGS（显示行号） */
-    uint8_t info_sel;               /* BOOK_INFO 动作 0..3 */
+    uint8_t info_sel;               /* BOOK_INFO 动作 0..4 */
+    uint16_t toc_count;             /* 当前书已索引章节总数 */
+    uint16_t toc_sel;               /* TOC 列表当前选中章下标 */
     uint8_t jump_pct;               /* JUMP 目标百分比 0..100 */
     uint8_t time_step;              /* TIME_SET 0=年..4=分 */
     uint16_t set_year;              /* TIME_SET 的待提交值 */
@@ -70,7 +80,7 @@ typedef struct {
 
     /* 当前书 */
     uint8_t book_open;              /* 1 = 有打开的书 */
-    uint8_t book_idx;               /* 目录槽 0..7 */
+    uint16_t book_idx;              /* 目录槽 0..MP_MAX_SLOTS-1 */
     uint32_t char_pos;              /* 本页首字节 */
     uint32_t book_len;              /* min(目录声明长度, stat 真实大小) */
     mp_page_t page;                 /* 当前页（measure 的结果） */

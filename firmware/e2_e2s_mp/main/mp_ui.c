@@ -47,6 +47,10 @@ static const char TXT_BL_ADJUST[] = "调整";
 static const char TXT_BL_CONFIRM[] = "确定";
 static const char TXT_LOW_BATT_1[] = "电量耗尽";
 static const char TXT_LOW_BATT_2[] = "请充电";
+static const char TXT_CHG_TITLE[] = "充电中";
+static const char TXT_CHG_FULL[] = "已充满";
+static const char TXT_CHG_SUB[] = "已接通电源";
+static const char TXT_CHG_FULL_SUB[] = "电量已满";
 static const char *const k_bl_level_names[4] = {"关闭", "1档", "2档", "3档"};
 
 /* 5x7 电量及刻度数字；bit4 是最左像素，'0' 不带斜杠。 */
@@ -397,6 +401,22 @@ static void bt_icon(uint8_t *fb, int x, int y)
     }
 }
 
+static void bolt_icon_small(uint8_t *fb, int x, int y)
+{
+    /* 6x11 顶部状态栏小闪电（参考官方状态栏充电图标 0x3C178840 并适配 13 px 电池）。 */
+    static const uint8_t rows[11] = {
+        0x02, 0x06, 0x0E, 0x1C, 0x3C, 0x3F,
+        0x0F, 0x0E, 0x1C, 0x18, 0x10,
+    };
+    for (int j = 0; j < 11; j++) {
+        for (int i = 0; i < 6; i++) {
+            if (rows[j] & (uint8_t)(0x20u >> i)) {
+                gfx_px(fb, x + i, y + j, 1);
+            }
+        }
+    }
+}
+
 void mp_ui_battery(uint8_t *fb, int x, int y, uint8_t pct, uint8_t valid,
                    uint8_t charging)
 {
@@ -411,8 +431,8 @@ void mp_ui_battery(uint8_t *fb, int x, int y, uint8_t pct, uint8_t valid,
     gfx_rect(fb, x + MP_BATT_W, y + 4, MP_BATT_CAP_W, MP_BATT_CAP_H, 1);
 
     if (charging) {
-        gfx_hline(fb, x - 7, x - 3, y + 6, 1);
-        gfx_vline(fb, x - 5, y + 4, y + 8, 1);
+        /* 电池图标左侧 2 px 间隙处绘制 6x11 小闪电（不侵入蓝牙符文区）。 */
+        bolt_icon_small(fb, x - 7, y + 1);
     }
     if (!valid) {
         return;
@@ -504,7 +524,7 @@ static uint8_t list_visible(const mp_ui_state_t *st)
 }
 
 /* 超过 4 项时在右侧 x=243..244, y=21..101 绘制轻盈滚动指示条。 */
-static void ui_scrollbar(uint8_t *fb, uint8_t scroll, uint8_t total)
+static void ui_scrollbar(uint8_t *fb, uint16_t scroll, uint16_t total)
 {
     if (total <= MP_LIST_ROWS) {
         return;
@@ -892,7 +912,7 @@ void mp_ui_msg(uint8_t *fb, const mp_ui_state_t *st)
         ICON_CHECK
     } kind = ICON_NONE;
 
-    if (st->screen == MP_SCREEN_EMPTY) {
+    if (st->screen == MP_SCREEN_EMPTY || st->screen == MP_SCREEN_TOC_EMPTY) {
         kind = ICON_BOOK;
     } else if (st->screen == MP_SCREEN_ERROR) {
         kind = ICON_WARN;
@@ -1009,31 +1029,47 @@ void mp_ui_book_info(uint8_t *fb, const mp_ui_state_t *st)
     ui_dotted_hline(fb, MP_CONTENT_X, MP_CONTENT_X + MP_CONTENT_W - 1,
                     MP_INFO_RULE_Y);
 
-    uint8_t n = st->row_count;
+    uint16_t n = st->row_count;
     if (n > MP_INFO_ACT_ROWS) {
         n = MP_INFO_ACT_ROWS;
     }
-    for (uint8_t i = 0; i < n; i++) {
-        int col = (int)i % 2;
-        int row = (int)i / 2;
-        int x = MP_CONTENT_X + col * (MP_INFO_BTN_W + MP_INFO_BTN_GAP_X);
-        int y = MP_INFO_BTN_TOP + row * (MP_INFO_BTN_H + MP_INFO_BTN_GAP_Y);
+    for (uint16_t i = 0; i < n; i++) {
+        int x;
+        int y;
+        int bw;
+        if (n <= 4u) {
+            int col = (int)i % 2;
+            int row = (int)i / 2;
+            bw = MP_INFO_BTN_W;
+            x = MP_CONTENT_X + col * (MP_INFO_BTN_W + MP_INFO_BTN_GAP_X);
+            y = MP_INFO_BTN_TOP + row * (MP_INFO_BTN_H + MP_INFO_BTN_GAP_Y);
+        } else if (i < 2u) {
+            /* 上排 2 颗（114 + 6 + 114 = 234）：目录 / 跳转 */
+            bw = MP_INFO_BTN_W;
+            x = MP_CONTENT_X + (int)i * (MP_INFO_BTN_W + MP_INFO_BTN_GAP_X);
+            y = MP_INFO_BTN_TOP;
+        } else {
+            /* 下排 3 颗（74 + 6 + 74 + 6 + 74 = 234）：重置进度 / 返回书库 / 删除本书 */
+            int col = (int)i - 2;
+            bw = MP_INFO_BTN3_W;
+            x = MP_CONTENT_X + col * (MP_INFO_BTN3_W + MP_INFO_BTN_GAP_X);
+            y = MP_INFO_BTN_TOP + MP_INFO_BTN_H + MP_INFO_BTN_GAP_Y;
+        }
         int selected = ((int)st->sel == (int)i);
         int fg = selected ? 0 : 1;
 
         if (selected) {
-            ui_rrect_fill(fb, x, y, MP_INFO_BTN_W, MP_INFO_BTN_H, 1);
+            ui_rrect_fill(fb, x, y, bw, MP_INFO_BTN_H, 1);
         } else {
-            ui_rrect_frame(fb, x, y, MP_INFO_BTN_W, MP_INFO_BTN_H, 1);
+            ui_rrect_frame(fb, x, y, bw, MP_INFO_BTN_H, 1);
         }
         if (st->row[i].label) {
             int w = ui_text_width(st->row[i].label);
-            int tx = x + (MP_INFO_BTN_W - w) / 2;
+            int tx = x + (bw - w) / 2;
             if (tx < x + 2) {
                 tx = x + 2;
             }
-            ui_text_color(fb, tx, y + 3, st->row[i].label,
-                          MP_INFO_BTN_W - 4, fg);
+            ui_text_color(fb, tx, y + 3, st->row[i].label, bw - 4, fg);
         }
     }
 }
@@ -1279,6 +1315,102 @@ void mp_ui_backlight_popup(uint8_t *fb, const mp_ui_state_t *st)
     px += g1 + gap;
     mp_hints_keycap(fb, MP_HINT_OK, px, 77);
     mp_ui_text(fb, px + MP_KEYCAP_W + MP_KEYCAP_GAP, 76, TXT_BL_CONFIRM, w_ok);
+}
+
+static void charge_batt_v_icon(uint8_t *fb, int x, int y, uint8_t pct,
+                               uint8_t valid)
+{
+    /* 26x42 竖版充电电池图标：
+     *   - 顶部居中 10x3 微圆角正极帽（y..y+2）
+     *   - 26x39 微圆角 2 px 粗外壳（y+3..y+41，与 low_batt_icon 同设计语言）
+     *   - 内腔 18x31（x+4..x+21, y+7..y+37）按真实电量自底向上填充黑芯
+     *   - 居中 11x15 充电闪电，按所在像素是否落在黑芯内逐点反色 */
+    gfx_hline(fb, x + 9, x + 16, y, 1);
+    gfx_rect(fb, x + 8, y + 1, 10, 2, 1);
+
+    ui_rrect_frame(fb, x, y + 3, 26, 39, 1);
+    ui_rrect_frame(fb, x + 1, y + 4, 24, 37, 1);
+    gfx_px(fb, x + 2, y + 5, 1);
+    gfx_px(fb, x + 23, y + 5, 1);
+    gfx_px(fb, x + 2, y + 39, 1);
+    gfx_px(fb, x + 23, y + 39, 1);
+
+    const int inner_x = x + 4;
+    const int inner_w = 18;
+    const int inner_y0 = y + 7;
+    const int inner_h = 31;
+    int fill_top = inner_y0 + inner_h;
+
+    if (valid) {
+        int fill_h = (inner_h * (int)pct + 50) / 100;
+        if (pct > 0 && fill_h == 0) {
+            fill_h = 1;
+        }
+        if (fill_h > inner_h) {
+            fill_h = inner_h;
+        }
+        if (fill_h > 0) {
+            fill_top = inner_y0 + inner_h - fill_h;
+            ui_rrect_fill(fb, inner_x, fill_top, inner_w, fill_h, 1);
+        }
+    }
+
+    /* 居中 11x15 充电闪电（x+7..x+17, y+15..y+29），与黑芯交界处逐点反色。 */
+    static const uint16_t bolt[15] = {
+        0x010, 0x030, 0x070, 0x0F0, 0x1F0,
+        0x3E0, 0x7E0, 0x7FF, 0x03F, 0x03E,
+        0x07C, 0x078, 0x070, 0x060, 0x040,
+    };
+    int bx = x + 7;
+    int by = y + 15;
+    for (int j = 0; j < 15; j++) {
+        int py = by + j;
+        int black = (py >= fill_top) ? 0 : 1;
+        for (int i = 0; i < 11; i++) {
+            if (bolt[j] & (uint16_t)(0x400u >> i)) {
+                gfx_px(fb, bx + i, py, black);
+            }
+        }
+    }
+}
+
+void mp_ui_charge_popup(uint8_t *fb, const mp_ui_state_t *st)
+{
+    if (!fb || !st) {
+        return;
+    }
+    uint8_t pct = st->battery > 100 ? 100 : st->battery;
+    bool full = (st->battery_valid && pct >= 100);
+
+    /* 外围 2 px 白边留空 + 194x78 2 px 粗微圆角边框（与背光浮窗完全同构）。 */
+    ui_rrect_fill(fb, 26, 20, 198, 82, 0);
+    ui_rrect_frame(fb, 28, 22, 194, 78, 1);
+    ui_rrect_frame(fb, 29, 23, 192, 76, 1);
+
+    /* 右侧主/副文案：上行"充电中 85%"/"已充满 100%"/"充电中"，下行"已接通电源"/"电量已满"。 */
+    char title[24];
+    if (st->battery_valid) {
+        snprintf(title, sizeof(title), "%s %u%%",
+                 full ? TXT_CHG_FULL : TXT_CHG_TITLE, (unsigned)pct);
+    } else {
+        snprintf(title, sizeof(title), "%s", TXT_CHG_TITLE);
+    }
+    const char *sub = full ? TXT_CHG_FULL_SUB : TXT_CHG_SUB;
+    int tw = mp_ui_text_w(title);
+    int sw = mp_ui_text_w(sub);
+    int text_w = ui_max(tw, sw);
+
+    /* 左 26x42 竖电池 + 16 px 间距 + 右文字块，整体在弹窗内水平与垂直严格居中。 */
+    const int icon_w = 26;
+    const int gap = 16;
+    int total_w = icon_w + gap + text_w;
+    int gx = (MP_FB_W - total_w) / 2;
+    int tx = gx + icon_w + gap;
+
+    charge_batt_v_icon(fb, gx, 40, pct, st->battery_valid);
+    mp_ui_text(fb, tx, 40, title, tw);
+    ui_dotted_hline(fb, tx, tx + text_w - 1, 61);
+    mp_ui_text(fb, tx, 66, sub, sw);
 }
 
 static void low_batt_icon(uint8_t *fb, int x, int y)
@@ -1544,6 +1676,9 @@ void mp_ui_render(const mp_ui_state_t *st, uint8_t *fb)
 
     if (st->screen == MP_SCREEN_LOCK) {
         mp_ui_lock(fb, st);
+        if (st->charge_popup) {
+            mp_ui_charge_popup(fb, st);
+        }
         return;
     }
     if (st->screen == MP_SCREEN_LOW_BATT) {
@@ -1558,6 +1693,7 @@ void mp_ui_render(const mp_ui_state_t *st, uint8_t *fb)
         mp_ui_clock(fb, st);
         break;
     case MP_SCREEN_SELECT:
+    case MP_SCREEN_TOC:
         mp_ui_list(fb, st);
         break;
     case MP_SCREEN_SETTINGS:
@@ -1582,6 +1718,7 @@ void mp_ui_render(const mp_ui_state_t *st, uint8_t *fb)
         mp_ui_backlight(fb, st);
         break;
     case MP_SCREEN_EMPTY:
+    case MP_SCREEN_TOC_EMPTY:
     case MP_SCREEN_ERROR:
     case MP_SCREEN_RESTORE:
     case MP_SCREEN_DELETE:
@@ -1601,5 +1738,7 @@ void mp_ui_render(const mp_ui_state_t *st, uint8_t *fb)
 
     if (st->bl_popup) {
         mp_ui_backlight_popup(fb, st);
+    } else if (st->charge_popup) {
+        mp_ui_charge_popup(fb, st);
     }
 }
