@@ -333,6 +333,18 @@ void mp_ui_backlight_popup(uint8_t *fb, const mp_ui_state_t *st)
     mp_ui_text_center(fb, 50, buf);
 }
 
+void mp_ui_charge_popup(uint8_t *fb, const mp_ui_state_t *st)
+{
+    if (!fb || !st) {
+        return;
+    }
+    gfx_rect(fb, 30, 26, 190, 68, 0);
+    gfx_frame(fb, 30, 26, 190, 68, 1);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "CHG %u%%", (unsigned)st->battery);
+    mp_ui_text_center(fb, 50, buf);
+}
+
 void mp_ui_low_batt(uint8_t *fb)
 {
     if (!fb) {
@@ -357,6 +369,9 @@ void mp_ui_render(const mp_ui_state_t *st, uint8_t *fb)
     }
     if (st->screen == MP_SCREEN_LOCK) {
         mp_ui_lock(fb, st);
+        if (st->charge_popup) {
+            mp_ui_charge_popup(fb, st);
+        }
         return;
     }
     if (st->screen == MP_SCREEN_LOW_BATT) {
@@ -370,6 +385,7 @@ void mp_ui_render(const mp_ui_state_t *st, uint8_t *fb)
         break;
     case MP_SCREEN_SELECT:
     case MP_SCREEN_SETTINGS:
+    case MP_SCREEN_TOC:
         mp_ui_list(fb, st);
         break;
     case MP_SCREEN_READ:
@@ -383,6 +399,7 @@ void mp_ui_render(const mp_ui_state_t *st, uint8_t *fb)
         mp_ui_backlight(fb, st);
         break;
     case MP_SCREEN_EMPTY:
+    case MP_SCREEN_TOC_EMPTY:
     case MP_SCREEN_ERROR:
     case MP_SCREEN_RESTORE:
     case MP_SCREEN_NO_LOCK_IMG:
@@ -399,5 +416,7 @@ void mp_ui_render(const mp_ui_state_t *st, uint8_t *fb)
     }
     if (st->bl_popup) {
         mp_ui_backlight_popup(fb, st);
+    } else if (st->charge_popup) {
+        mp_ui_charge_popup(fb, st);
     }
 }

@@ -22,6 +22,15 @@ COMPONENTS := $(ROOT)/components
 MAIN    := $(ROOT)/main
 BUILD   := $(SIM_DIR)/build
 BIN     := $(BUILD)/sim_mp
+FW_BIN  := $(BUILD)/sim_fw_regress
+
+# 固件全链路回归测试默认开启 ASan + UBSan；可通过 SANITIZE=0 关闭。
+SANITIZE ?= 1
+ifeq ($(SANITIZE),1)
+FW_SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer
+else
+FW_SAN_FLAGS :=
+endif
 
 # The ask requires gcc; honor an explicit CC=... from the command line or the
 # environment, but override make's built-in default ("cc").
@@ -128,7 +137,7 @@ CONFIG_STAMP := $(BUILD)/config.stamp
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean print-config FORCE
+.PHONY: all clean print-config regress fw-regress FORCE
 
 $(CONFIG_STAMP): FORCE
 	@mkdir -p $(BUILD)
@@ -143,6 +152,58 @@ $(BIN): $(SRCS) $(HEADERS) $(CONFIG_STAMP) $(MAKEFILE_LIST)
 	$(CC) $(CFLAGS) $(HOST_DEFS) $(CPPFLAGS) \
 	    -DSIM_UI_KIND='"$(UI_KIND)"' -DSIM_HINTS_KIND='"$(HINTS_KIND)"' \
 	    $(SRCS) -o $@
+
+# --------------------------------------------------------------------------
+# 全链路本机固件回归测试二进制（编译真实 mp_app/mp_store/mp_toc/mp_ota/recovery）
+# --------------------------------------------------------------------------
+FW_SRCS := $(SIM_DIR)/sim_fw_regress.c \
+           $(SIM_DIR)/sim_hal.c \
+           $(SIM_DIR)/sim_text.c \
+           $(MAIN)/mp_app.c \
+           $(MAIN)/mp_store.c \
+           $(MAIN)/mp_toc.c \
+           $(MAIN)/mp_ota.c \
+           $(MAIN)/mp_ui.c \
+           $(MAIN)/mp_hints.c \
+           $(MAIN)/mp_font.c \
+           $(MAIN)/mp_page.c \
+           $(COMPONENTS)/recovery/recovery.c \
+           $(COMPONENTS)/power/power_filter.c \
+           $(COMPONENTS)/display/gfx.c \
+           $(COMPONENTS)/text/text_font.c \
+           $(COMPONENTS)/text/text_encode.c \
+           $(COMPONENTS)/text/font8x16.c \
+           $(COMPONENTS)/common/crc32.c \
+           $(COMPONENTS)/common/rc_util.c
+
+FW_CPPFLAGS := -I$(SIM_DIR)/host_inc \
+               -I$(MAIN) -I$(SIM_DIR) \
+               -I$(COMPONENTS)/common/include \
+               -I$(COMPONENTS)/display/include \
+               -I$(COMPONENTS)/input/include \
+               -I$(COMPONENTS)/power/include \
+               -I$(COMPONENTS)/recovery/include \
+               -I$(COMPONENTS)/storage/include \
+               -I$(COMPONENTS)/text/include \
+               -I$(COMPONENTS)/text \
+               -D_GNU_SOURCE -DTEXT_HOST_BUILD -include stdbool.h \
+               -DMP_DIR='"./mp"' -DMP_TOC_DIR='"./mp"' \
+               -DSIM_ASSET_DIR_DEFAULT='"$(TEXT_ASSETS)"'
+
+FW_HEADERS := $(HEADERS) \
+              $(wildcard $(SIM_DIR)/host_inc/*.h) \
+              $(wildcard $(SIM_DIR)/host_inc/*/*.h) \
+              $(wildcard $(SIM_DIR)/host_inc/*/*/*.h) \
+              $(wildcard $(COMPONENTS)/*/include/*.h)
+
+$(FW_BIN): $(FW_SRCS) $(FW_HEADERS) $(MAKEFILE_LIST)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(FW_SAN_FLAGS) $(FW_CPPFLAGS) $(FW_SRCS) -o $@
+
+fw-regress: $(FW_BIN)
+
+regress: $(FW_BIN)
+	@$(FW_BIN)
 
 print-config:
 	@echo "sim_dir      $(SIM_DIR)"

@@ -90,11 +90,11 @@ static void fx_clock(mp_ui_state_t *st)
 static void fx_select(mp_ui_state_t *st)
 {
     base_state(st, MP_SCREEN_SELECT);
-    left_text(st, "书库 3/8", MP_STR_UTF8);
+    left_text(st, "书库 3", MP_STR_UTF8);
     st->row_count = SIM_STORE_BOOKS; /* 列表只有书；退出走底栏返回 */
     st->sel = 1;                     /* ASCII "Moby Dick" selected */
     st->scroll = mp_ui_list_scroll(st->sel, st->row_count);
-    sim_store_fill_rows(st->row, st->scroll);
+    sim_store_fill_rows(st->row, (uint8_t)st->scroll);
 }
 
 static void fx_settings(mp_ui_state_t *st, uint8_t sel)
@@ -104,7 +104,7 @@ static void fx_settings(mp_ui_state_t *st, uint8_t sel)
     st->row_count = SIM_SETTINGS_ROWS;
     st->sel = sel;
     st->scroll = mp_ui_list_scroll(sel, st->row_count);
-    sim_settings_fill_rows(st->row, st->scroll);
+    sim_settings_fill_rows(st->row, (uint8_t)st->scroll);
 }
 
 static void fx_settings_sel0(mp_ui_state_t *st) { fx_settings(st, 0); }
@@ -117,7 +117,7 @@ static void fx_settings_e2(mp_ui_state_t *st)
     st->row_count = SIM_SETTINGS_E2_ROWS;
     st->sel = 0;
     st->scroll = mp_ui_list_scroll(st->sel, st->row_count);
-    sim_settings_e2_fill_rows(st->row, st->scroll);
+    sim_settings_e2_fill_rows(st->row, (uint8_t)st->scroll);
 }
 
 static void read_common(mp_ui_state_t *st, uint8_t book_idx, uint8_t enc,
@@ -137,6 +137,16 @@ static void fx_backlight_popup(mp_ui_state_t *st)
     st->battery = 42;
     st->bl_level = 2;
     st->bl_popup = 1;
+}
+
+static void fx_charge_popup(mp_ui_state_t *st)
+{
+    read_common(st, 2, MP_ENC_GB2312, 0);
+    st->percent = 42;
+    st->battery = 85;
+    st->battery_valid = 1;
+    st->charging = 1;
+    st->charge_popup = 1;
 }
 
 static void fx_low_batt(mp_ui_state_t *st)
@@ -257,21 +267,55 @@ static void fx_lock_stats(mp_ui_state_t *st)
 
 static void fx_book_info(mp_ui_state_t *st)
 {
-    static const char *const actions[4] = {
-        "跳转", "重置阅读进度", "返回书库", "删除本书",
+    static const char *const actions[MP_INFO_ACT_ROWS] = {
+        "目录", "跳转", "重置进度", "返回书库", "删除本书",
     };
     base_state(st, MP_SCREEN_BOOK_INFO);
     left_text(st, "红楼梦", MP_STR_UTF8);
     st->meta.text = "字数 1.2万\t进度 42%\t大小 1.2MB";
     st->meta.enc = MP_STR_UTF8;
-    st->row_count = 4;
+    st->row_count = MP_INFO_ACT_ROWS;
     st->sel = 0;
     st->battery = 42;
-    for (uint8_t i = 0; i < 4; i++) {
+    for (uint8_t i = 0; i < MP_INFO_ACT_ROWS; i++) {
         st->row[i].label = actions[i];
         st->row[i].enc = MP_STR_UTF8;
         st->row[i].kind = MP_ROW_TEXT;
     }
+}
+
+static void fx_toc(mp_ui_state_t *st)
+{
+    static const char *const chapters[MP_LIST_ROWS] = {
+        /* 第一回 甄士隐梦幻识通灵 */
+        "\xB5\xDA\xD2\xBB\xBB\xD8 \xD5\xE7\xCA\xBF\xD2\xFE\xC3\xCE\xBB\xC3\xCA\xB6\xCD\xA8\xC1\xE9",
+        /* 第二回 贾夫人仙逝扬州城 */
+        "\xB5\xDA\xB6\xFE\xBB\xD8 \xBC\xD6\xB7\xF2\xC8\xCB\xCF\xC9\xCA\xC5\xD1\xEF\xD6\xDD\xB3\xC7",
+        /* 第三回 贾雨村夤缘复旧职 */
+        "\xB5\xDA\xC8\xFD\xBB\xD8 \xBC\xD6\xD3\xEA\xB4\xE5\xE2\xB9\xD4\xB5\xB8\xB4\xBE\xC9\xD6\xB0",
+        /* 第四回 薄命女偏逢薄命郎 */
+        "\xB5\xDA\xCB\xC4\xBB\xD8 \xB1\xA1\xC3\xFC\xC5\xAE\xC6\xAB\xB7\xEA\xB1\xA1\xC3\xFC\xC0\xC9",
+    };
+    base_state(st, MP_SCREEN_TOC);
+    left_text(st, "目录", MP_STR_UTF8);
+    st->time_valid = 0;
+    st->mid = "3/120";
+    st->row_count = 120;
+    st->sel = 2;
+    st->scroll = 0;
+    st->battery = 42;
+    for (uint8_t i = 0; i < MP_LIST_ROWS; i++) {
+        st->row[i].label = chapters[i];
+        st->row[i].enc = MP_STR_GB2312;
+        st->row[i].kind = MP_ROW_TEXT;
+    }
+}
+
+static void fx_toc_empty(mp_ui_state_t *st)
+{
+    base_state(st, MP_SCREEN_TOC_EMPTY);
+    left_text(st, "目录", MP_STR_UTF8);
+    msg2(st, "未识别到章节", "可用进度跳转");
 }
 
 static void fx_jump(mp_ui_state_t *st)
@@ -380,7 +424,10 @@ static const fixture_t k_fixtures[] = {
     { "settings_e2",     MP_SCREEN_SETTINGS, 0,           fx_settings_e2 },
     { "backlight",       MP_SCREEN_BACKLIGHT, 0,          fx_backlight },
     { "backlight_popup", MP_SCREEN_READ,      0,          fx_backlight_popup },
+    { "charge_popup",    MP_SCREEN_READ,      0,          fx_charge_popup },
     { "book_info",       MP_SCREEN_BOOK_INFO, 0,          fx_book_info },
+    { "toc",             MP_SCREEN_TOC,       0,          fx_toc },
+    { "toc_empty",       MP_SCREEN_TOC_EMPTY, 0,          fx_toc_empty },
     { "jump",            MP_SCREEN_JUMP,      0,          fx_jump },
     { "time_set",        MP_SCREEN_TIME_SET,  0,          fx_time_set },
     { "time_done",       MP_SCREEN_TIME_DONE, 0,          fx_time_done },
@@ -525,7 +572,8 @@ static int selected_bar_ok(const uint8_t *fb, const fixture_t *fx)
     memset(&st, 0, sizeof st);
     fx->build(&st);
 
-    if (fx->screen == MP_SCREEN_SETTINGS || fx->screen == MP_SCREEN_SELECT) {
+    if (fx->screen == MP_SCREEN_SETTINGS || fx->screen == MP_SCREEN_SELECT ||
+        fx->screen == MP_SCREEN_TOC) {
         int bar_w = (st.row_count > MP_LIST_ROWS) ? 233 : MP_SEL_BAR_W;
         row = (int)st.sel - (int)st.scroll;
         if (row < 0 || row >= MP_LIST_ROWS) {
@@ -540,12 +588,27 @@ static int selected_bar_ok(const uint8_t *fb, const fixture_t *fx)
         if (row < 0 || row >= MP_INFO_ACT_ROWS) {
             return 0;
         }
-        int col = row % 2;
-        int r = row / 2;
-        int x = MP_CONTENT_X + col * (MP_INFO_BTN_W + MP_INFO_BTN_GAP_X);
-        int y = MP_INFO_BTN_TOP + r * (MP_INFO_BTN_H + MP_INFO_BTN_GAP_Y);
+        int x;
+        int y;
+        int bw;
+        if (st.row_count <= 4u) {
+            int col = row % 2;
+            int r = row / 2;
+            bw = MP_INFO_BTN_W;
+            x = MP_CONTENT_X + col * (MP_INFO_BTN_W + MP_INFO_BTN_GAP_X);
+            y = MP_INFO_BTN_TOP + r * (MP_INFO_BTN_H + MP_INFO_BTN_GAP_Y);
+        } else if (row < 2) {
+            bw = MP_INFO_BTN_W;
+            x = MP_CONTENT_X + row * (MP_INFO_BTN_W + MP_INFO_BTN_GAP_X);
+            y = MP_INFO_BTN_TOP;
+        } else {
+            int col = row - 2;
+            bw = MP_INFO_BTN3_W;
+            x = MP_CONTENT_X + col * (MP_INFO_BTN3_W + MP_INFO_BTN_GAP_X);
+            y = MP_INFO_BTN_TOP + MP_INFO_BTN_H + MP_INFO_BTN_GAP_Y;
+        }
         return px_is_black(fb, x + 1, y) &&
-               px_is_black(fb, x + MP_INFO_BTN_W - 2, y);
+               px_is_black(fb, x + bw - 2, y);
     }
     if (fx->screen == MP_SCREEN_TIME_SET) {
         static const int box_x[MP_TIME_FIELDS] = {

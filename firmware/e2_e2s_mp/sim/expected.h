@@ -1,5 +1,5 @@
 #pragma once
-/* expected.h — 27 帧的 32 位像素哈希（sim --check 的唯一真源）。
+/* expected.h — 30 帧的 32 位像素哈希（sim --check 的唯一真源）。
  *
  * 哈希 = rc_crc32_ieee(framebuffer, MP_FB_BYTES)，在 mp_ui_render() 之后、
  * 任何 PGM 转换之前计算，包含每行 x=250..255 的填充位。任何绘制变化都必须
@@ -19,7 +19,7 @@ typedef struct {
 
 static const sim_expected_t k_expected_frames[] = {
     { "clock",           0x19CD15C9u },
-    { "select",          0x0864484Bu },
+    { "select",          0x7CC0A919u },
     { "read_cn",         0x8810CB34u },
     { "read_en",         0x96A0C84Au },
     { "read_end",        0x20107F3Cu },
@@ -29,13 +29,16 @@ static const sim_expected_t k_expected_frames[] = {
     { "settings_e2",     0xEC9484A0u },
     { "backlight",       0x5C4811E0u },
     { "backlight_popup", 0xC8B7D696u },
-    { "book_info",       0x6FEDF09Bu },
+    { "charge_popup",    0xE44571F5u },
+    { "book_info",       0x58652DDCu },
+    { "toc",             0xEF959513u },
+    { "toc_empty",       0x2DCAE384u },
     { "jump",            0xF41BBB82u },
     { "time_set",        0x3851BBD2u },
     { "time_done",       0x84BC14F3u },
     { "delete",          0x15AC5928u },
-    { "about",           0x6E8D8173u },
-    { "about_e2",        0xB598DFBBu },
+    { "about",           0xD3E9D89Bu },
+    { "about_e2",        0x08FC8653u },
     { "lock_img",        0x05B429D0u },
     { "lock_stats",      0x3488E5C5u },
     { "lock_none",       0xF7A7DD72u },

@@ -159,8 +159,13 @@ uint8_t mp_hints_for(mp_screen_t screen, mp_hint_set_t *out)
         set_item(out, &n, 1, next, NULL, "书库");
         break;
     case MP_SCREEN_SELECT:
+    case MP_SCREEN_TOC:
         set_item(out, &n, 2, prev_next, NULL, "选择");
         set_item(out, &n, 1, ok, NULL, "打开");
+        set_item(out, &n, 1, menu, NULL, "返回");
+        break;
+    case MP_SCREEN_TOC_EMPTY:
+        set_item(out, &n, 1, ok, NULL, "跳转");
         set_item(out, &n, 1, menu, NULL, "返回");
         break;
     case MP_SCREEN_SETTINGS:

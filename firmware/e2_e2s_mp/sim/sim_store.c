@@ -44,11 +44,11 @@ static const uint8_t k_settings_e2_kind[SIM_SETTINGS_E2_ROWS] = {
     MP_ROW_ACTION, MP_ROW_ACTION,
 };
 
-/* ABOUT is one page now: storage space moved into the 4th line in MB. */
+/* 关于页单屏四行：版本、构建日期与 CMake PROJECT_VER 同步，第 4 行为存储占用。 */
 static const char *const k_about[MP_LIST_ROWS] = {
     "Miaopaper E2S",
-    "固件 1.0.3",
-    "构建 2026-11-25",
+    "固件 1.2.0",
+    "构建 2026-11-27",
     "存储 12.4/118.5MB",
 };
 

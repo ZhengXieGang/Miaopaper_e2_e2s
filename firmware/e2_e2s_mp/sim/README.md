@@ -166,6 +166,31 @@ UI 的 ASCII 与大号时钟使用 `main/fonts/font_ui16.h` 和 `font_clock.h`�
 | `make_contact.py` | PGM 转 3× PNG 和 2 列 contact sheet，依赖 Pillow |
 | `run.sh` | 构建、渲染、出图；支持 `--all/--one/--check/--out/--ui/--hints/--no-build` |
 
+## 全链路固件回归测试（`sim_fw_regress`）
+
+除静态 30 帧 UI 渲染与像素黄金哈希回归外，`sim/` 现已内置**本机全链路固件行为回归测试套件**（`sim_fw_regress.c` + `sim_hal.c` + `host_inc/`），直接在 Linux 主机上编译真实生产核心源码：
+
+- `main/mp_app.c`、`main/mp_store.c`、`main/mp_toc.c`、`main/mp_ota.c`
+- `main/mp_ui.c`、`main/mp_hints.c`、`main/mp_font.c`、`main/mp_page.c`
+- `components/recovery/recovery.c`、`components/display/gfx.c`、`components/text/*`、`components/common/*`
+
+特点：
+- 默认开启 `-Wall -Wextra -Werror -fsanitize=address,undefined`（ASan + UBSan 内存越界与未定义行为实时检测）；
+- 每个用例运行在独立 `fork()` 子进程与独立 `/tmp/mp_fw_reg_*` 虚拟 SD 沙盒内（退出自动清理）；
+- 内置 8 MiB 虚拟 SPI Flash（含硬件级写保护红线、NOR 按位与物理特性、FIPS 180-4 SHA-256 与 ESP32-S3 镜像格式验证器），`T11` 会优先自动加载真实构建产物 `build/miaopaper_e2_e2s.bin` 跑完 `0x50..0x53` BLE OTA 与 IRAM 覆写审计；
+- 通过 ELF 自定义段 `mp_sim_rtc` 复刻 ESP32-S3 `RTC_DATA_ATTR` 慢速内存，支持双进程冷启动真模拟跨深睡唤醒与走时保持。
+
+常用命令：
+
+```sh
+cd firmware/e2_e2s_mp
+
+sh sim/run.sh --check             # 一站式：30 帧 UI 校验 + 文案 lint + 17 项固件全链路回归
+sh sim/run.sh --regress           # 仅运行 17 项本机固件回归测试
+sh sim/run.sh --regress --only T11 # 仅运行单项（如真实镜像原地 BLE OTA 测试）
+make -C sim regress SANITIZE=0    # 关闭 Sanitizer 快速编译运行
+```
+
 ## 排错
 
 - `sim_assets: ... missing`：CJK 会变空心框。检查 `MP_SIM_ASSETS` 或
