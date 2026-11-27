@@ -96,6 +96,13 @@
 #define MP_OP_PC1_STRONG_PD 0x43
 #define MP_OP_PC1_HIZ 0x44
 
+/* 第三方阅读器原生 BLE 固件原地自更新协议（0x50..0x54，与原版 0x10..0x44 零冲突）。 */
+#define MP_OP_OTA_INFO 0x50      /* 只读查询当前固件版本/槽位/哈希/电量（锁屏放行） */
+#define MP_OP_OTA_BEGIN 0x51     /* [len u32 BE][sha256 32B] 开启暂存会话 */
+#define MP_OP_OTA_DATA 0x52      /* [off u24 BE][data 1..240B] 顺序分片写入 */
+#define MP_OP_OTA_END 0x53       /* [] 整包校验 + IRAM 自刷写当前第三方槽 + 软复位 */
+#define MP_OP_OTA_ABORT 0x54     /* [] 取消会话并恢复原界面 */
+
 /* 0x1F1F 上的对时命令；后面 9 字节见 PORT_SPEC §7.5。 */
 #define MP_OP_SET_TIME 0xDD
 
@@ -112,6 +119,13 @@
 #define MP_ST_OK 0x00
 #define MP_ST_SLOTS_FULL 0x01     /* 8 槽全是 DONE */
 #define MP_ST_NO_SPACE 0x02       /* mp_store_space() 显示空间不足 */
+#define MP_ST_OTA_LOW_BATT 0x10   /* 电量低于 20% 且未充电，拒绝升级 */
+#define MP_ST_OTA_STAGE_DIRTY 0x11 /* 0x530000 暂存区存在未知非 0xFF 数据 */
+#define MP_ST_OTA_BAD_IMAGE 0x12  /* 镜像头/芯片型号/内置校验/项目名不匹配 */
+#define MP_ST_OTA_SHA_MISMATCH 0x13 /* 整包 SHA-256 校验失败 */
+#define MP_ST_OTA_SEQ 0x14        /* 数据偏移不连续/发生丢包 */
+#define MP_ST_OTA_FLASH_ERR 0x15  /* Flash 暂存擦写或回读失败 */
+#define MP_ST_OTA_LOCKED 0x16     /* 锁屏态拒绝写入，需先解锁 */
 #define MP_ST_BAD_PARAM 0xFD      /* 包长/长度/参数非法 */
 #define MP_ST_BUSY 0xFE           /* 面板忙 / 请稍后重试 */
 #define MP_ST_FAIL 0xFF           /* 通用失败 / 槽不存在 / 长度不符 / 锁屏拒绝 */

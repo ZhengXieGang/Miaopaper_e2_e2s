@@ -1,26 +1,27 @@
 #pragma once
-/* mp_store.h — SD-backed Miaopaper storage semantics.
+/* mp_store.h — 基于内置 SD 卡的电子书/目录/字库/锁屏/进度存储层。
  *
- * Miaopaper keeps its catalog, HZK16, reading progress and lock image in the
- * external NOR flash. The E2S has an SD card instead (and this project never
- * writes internal flash), so the same logical objects live under
- * /sdcard/mp/ with the *same* 8-slot / 32-byte catalog format:
+ * 目录文件 /sdcard/mp/catalog.bin 兼容原版 8 B 头 + N × 32 B 条目布局，
+ * 条目数按需动态增长（8 槽步进，旧版 8 槽文件自动无损兼容），书籍数量
+ * 不再设人为小上限，仅受设备存储空间限制：
  *
- *   catalog.bin   8 B header + 8 x 32 B entries ("BOOK", ver=1, font_ok, 0, 0)
- *   b0.bin..b7.bin  book data, one file per slot
- *   font.bin       uploaded HZK16 (optional; embedded font is used for render)
- *   lock.bin       4000 B lock image + 0xAA flag at offset 0x0FF0
- *   progress.bin   8 x 8 B {magic, idx, pos[4], xor}
- *   settings.bin   BLE/sleep/partial/GC/lock_display settings
- *   stats.bin      累计阅读统计（累计阅读秒数 / 累计阅读字数）
+ *   catalog.bin     8 B 头("BOOK", ver=1, font_ok, 0, 0) + N × 32 B 条目
+ *   b0.bin..bN.bin  每槽一本电子书正文
+ *   font.bin        上传字库（可选，默认使用内置 HZK16）
+ *   lock.bin        4000 B 锁屏图 + 0xAA 标志 @0x0FF0
+ *   progress.bin    N × 8 B {0x5A, idx_lo, pos[4], idx_hi, xor}
+ *   settings.bin    蓝牙/锁屏/局刷/GC/锁屏展示/背光设置
+ *   stats.bin       累计阅读统计（累计阅读秒数 / 累计阅读字数）
  *
- * Only /sdcard/mp is written. No NVS, no internal flash.
+ * 仅写 /sdcard/mp，不碰 NVS 与内部 Flash。
  */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#define MP_MAX_BOOKS 8
+#define MP_SLOT_CHUNK 8u
+#define MP_SLOT_INVALID 0xFFFFu
+#define MP_MAX_SLOTS 0xFFFEu
 #define MP_ENTRY_SIZE 32
 #define MP_TITLE_MAX 19
 
@@ -67,51 +68,49 @@ extern const uint16_t mp_gc_interval[MP_GC_INTERVAL_COUNT];
 extern mp_settings_t mp_settings;
 extern mp_stats_t mp_stats;
 
-/* Mount must already have succeeded (storage_init). Returns 0 on success. */
+/* 挂载完成后调用（幂等）。返回 0 成功。 */
 int mp_store_init(void);
 const char *mp_store_error(void);
 
-/* Catalog. */
-int mp_store_count_done(void);
-int mp_store_list_done(uint8_t slots[MP_MAX_BOOKS]);
-int mp_store_read(uint8_t idx, mp_book_t *out);
-bool mp_store_is_done(uint8_t idx);
-int mp_store_find_free_slot(void);
-int mp_store_begin(uint8_t idx, const char *title, uint32_t len, uint8_t enc);
-int mp_store_write(uint8_t idx, uint32_t off, const void *buf, size_t len);
+/* 动态目录接口（槽号 0..MP_MAX_SLOTS-1，仅受空间限制）。 */
+uint16_t mp_store_slot_capacity(void);
+uint16_t mp_store_count_done(void);
+uint16_t mp_store_list_done(uint16_t *slots, uint16_t max_slots);
+int mp_store_read(uint16_t idx, mp_book_t *out);
+bool mp_store_is_done(uint16_t idx);
+int32_t mp_store_find_free_slot(void);
+int mp_store_begin(uint16_t idx, const char *title, uint32_t len, uint8_t enc);
+int mp_store_write(uint16_t idx, uint32_t off, const void *buf, size_t len);
 /* 上传完成后、finish 之前记字数（0x1E..0x1F，单位 1024 字）。 */
-int mp_store_set_chars(uint8_t idx, uint32_t chars);
-int mp_store_finish(uint8_t idx);
-void mp_store_abort(uint8_t idx);
-int mp_store_delete(uint8_t idx);
-int mp_store_set_flag(uint8_t idx, uint8_t flags);
+int mp_store_set_chars(uint16_t idx, uint32_t chars);
+int mp_store_finish(uint16_t idx);
+void mp_store_abort(uint16_t idx);
+int mp_store_delete(uint16_t idx);
+int mp_store_set_flag(uint16_t idx, uint8_t flags);
 int mp_store_compact(void);
 
-/* Book data (read side). */
-int mp_store_read_book(uint8_t idx, uint32_t off, void *buf, size_t len);
-uint32_t mp_store_book_size(uint8_t idx);
+/* 电子书正文读取。 */
+int mp_store_read_book(uint16_t idx, uint32_t off, void *buf, size_t len);
+uint32_t mp_store_book_size(uint16_t idx);
 
-/* Lock image. */
+/* 锁屏图。 */
 bool mp_store_lock_valid(void);
 int mp_store_lock_begin(void);
 int mp_store_lock_write(uint32_t off, const void *buf, size_t len);
 int mp_store_lock_finish(void);
 int mp_store_lock_read(uint8_t *buf, size_t len);
 
-/* Uploaded font (kept for 0x16-0x18 / 0x19 compatibility). */
+/* 上传字库（保留 0x16-0x18 / 0x19 兼容）。 */
 bool mp_store_font_ok(void);
 int mp_store_font_begin(void);
 int mp_store_font_write(uint32_t off, const void *buf, size_t len);
 int mp_store_font_finish(void);
 
-/* Progress ring (latest position per book). */
-int mp_progress_save(uint8_t idx, uint32_t pos);
-bool mp_progress_load(uint8_t idx, uint32_t *pos);
+/* 每本书的阅读进度。 */
+int mp_progress_save(uint16_t idx, uint32_t pos);
+bool mp_progress_load(uint16_t idx, uint32_t *pos);
 
-/* Settings. */
-/* 填默认值（ble=1 / 锁屏 3 分钟 / 锁屏展示阅读数据 / 场景全刷 / GC 10）。
- * 只写 RAM，不落盘。main.c 必须在 mp_store_init() 之前无条件调用一次
- *（PORT_SPEC §6.7）。 */
+/* 设置（默认值只写 RAM，不落盘）。 */
 void mp_settings_defaults(void);
 int mp_settings_load(void);
 int mp_settings_save(void);
@@ -120,3 +119,7 @@ int mp_settings_save(void);
 void mp_stats_defaults(void);
 int mp_stats_load(void);
 int mp_stats_save(void);
+
+/* 墙钟时间快照：只写 /sdcard/mp/clock.bin，作为彻底掉电重启后的兜底恢复基准。 */
+bool mp_clock_load(uint32_t *unix_s);
+int mp_clock_save(uint32_t unix_s);

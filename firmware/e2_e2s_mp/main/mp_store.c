@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -18,11 +19,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include "mp_toc.h"
 #include "text.h"
 
 static const char *TAG = "mp_store";
 
+#ifndef MP_DIR
 #define MP_DIR "/sdcard/mp"
+#endif
 #define MP_CATALOG MP_DIR "/catalog.bin"
 #define MP_CATALOG_TMP MP_DIR "/catalog.tmp"
 #define MP_CATALOG_BAK MP_DIR "/catalog.bak"
@@ -34,16 +38,17 @@ static const char *TAG = "mp_store";
 #define MP_PROGRESS MP_DIR "/progress.bin"
 #define MP_SETTINGS MP_DIR "/settings.bin"
 #define MP_STATS MP_DIR "/stats.bin"
+#define MP_CLOCK MP_DIR "/clock.bin"
+#define MP_CLOCK_TMP MP_DIR "/clock.tmp"
+#define MP_CLOCK_BAK MP_DIR "/clock.bak"
 #define MP_BOOK_FMT MP_DIR "/b%u.bin"
 
 #define CATALOG_HDR 8
-#define CATALOG_BYTES (CATALOG_HDR + MP_MAX_BOOKS * MP_ENTRY_SIZE)
 #define LOCK_IMAGE_BYTES 4000
 #define LOCK_FILE_BYTES 4096      /* 4000 B 图 + 标志 @0x0FF0 */
 #define LOCK_FLAG_OFF 0x0FF0
 #define LOCK_FLAG_VALUE 0xAA
 #define FONT_BYTES 261696u
-#define PROGRESS_BYTES (MP_MAX_BOOKS * 8u)
 #define SETTINGS_MAGIC0 'M'
 #define SETTINGS_MAGIC1 'P'
 #define SETTINGS_MAGIC2 'S'
@@ -52,6 +57,10 @@ static const char *TAG = "mp_store";
 #define STATS_MAGIC1 'P'
 #define STATS_MAGIC2 'R'
 #define STATS_MAGIC3 '1'
+#define CLOCK_MAGIC0 'M'
+#define CLOCK_MAGIC1 'P'
+#define CLOCK_MAGIC2 'C'
+#define CLOCK_MAGIC3 '1'
 
 const uint16_t mp_sleep_timeout_s[MP_SLEEP_TIMEOUT_COUNT] = {60, 120, 180, 300};
 const uint16_t mp_gc_interval[MP_GC_INTERVAL_COUNT] = {10, 20, 50, 100};
@@ -60,11 +69,12 @@ mp_stats_t mp_stats;
 
 static SemaphoreHandle_t s_lock;
 static uint8_t s_hdr[CATALOG_HDR];
-static uint8_t s_entries[MP_MAX_BOOKS][MP_ENTRY_SIZE];
+static uint8_t (*s_entries)[MP_ENTRY_SIZE];
+static uint16_t s_slot_cap;
 static bool s_ready;
 static char s_err[72] = "not initialised";
 static int s_wfd = -1;
-static uint8_t s_wslot = 0xFF;
+static uint16_t s_wslot = MP_SLOT_INVALID;
 /* 0x10 声明的总长与已写高水位：write 用来拒绝越界/空洞，finish 用来核对
  * 文件真实大小（PORT_SPEC §6.6-1）。 */
 static uint32_t s_wdeclared;
@@ -118,9 +128,67 @@ static int read_all(int fd, void *buf, size_t len)
     return 0;
 }
 
-static void book_path(uint8_t idx, char *out, size_t cap)
+static void book_path(uint16_t idx, char *out, size_t cap)
 {
     snprintf(out, cap, MP_BOOK_FMT, (unsigned)idx);
+}
+
+static uint16_t align_slot_cap(uint32_t need)
+{
+    if (need < MP_SLOT_CHUNK) {
+        return MP_SLOT_CHUNK;
+    }
+    uint32_t aligned = ((need + MP_SLOT_CHUNK - 1u) / MP_SLOT_CHUNK) * MP_SLOT_CHUNK;
+    if (aligned > MP_MAX_SLOTS) {
+        aligned = MP_MAX_SLOTS;
+    }
+    return (uint16_t)aligned;
+}
+
+/* 确保内存目录容量至少达到 min_cap，新增条目统一初始化为 MP_FLAG_EMPTY(0xFF)。 */
+static int ensure_slot_cap_locked(uint16_t min_cap)
+{
+    if (min_cap > MP_MAX_SLOTS) {
+        return -1;
+    }
+    if (s_entries && s_slot_cap >= min_cap) {
+        return 0;
+    }
+    uint16_t new_cap = align_slot_cap(min_cap);
+    uint8_t (*grown)[MP_ENTRY_SIZE] =
+        (uint8_t (*)[MP_ENTRY_SIZE])realloc(s_entries, (size_t)new_cap * MP_ENTRY_SIZE);
+    if (!grown) {
+        set_err("catalog oom");
+        return -1;
+    }
+    if (new_cap > s_slot_cap) {
+        memset(grown + s_slot_cap, 0xFF, (size_t)(new_cap - s_slot_cap) * MP_ENTRY_SIZE);
+    }
+    s_entries = grown;
+    s_slot_cap = new_cap;
+    return 0;
+}
+
+static int reset_empty_catalog_locked(void)
+{
+    uint16_t cap = MP_SLOT_CHUNK;
+    uint8_t (*fresh)[MP_ENTRY_SIZE] =
+        (uint8_t (*)[MP_ENTRY_SIZE])malloc((size_t)cap * MP_ENTRY_SIZE);
+    if (!fresh) {
+        set_err("catalog oom");
+        return -1;
+    }
+    memset(fresh, 0xFF, (size_t)cap * MP_ENTRY_SIZE);
+    free(s_entries);
+    s_entries = fresh;
+    s_slot_cap = cap;
+    memset(s_hdr, 0, sizeof(s_hdr));
+    s_hdr[0] = 'B';
+    s_hdr[1] = 'O';
+    s_hdr[2] = 'O';
+    s_hdr[3] = 'K';
+    s_hdr[4] = 0x01;
+    return 0;
 }
 
 static void entry_title(const uint8_t *e, char *out)
@@ -167,14 +235,20 @@ static void build_entry(uint8_t *e, uint8_t flags, const char *title, uint32_t l
     e[0x1D] = enc;
 }
 
-/* 写整份文件 + fsync + close，任一步失败都返回 -1。 */
-static int write_file_sync(const char *path, const void *buf, size_t len)
+/* 写头 + 动态条目表 + fsync + close，零大栈缓冲，任一步失败都返回 -1。 */
+static int write_catalog_tmp_sync(void)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (!s_entries || s_slot_cap == 0) {
+        return -1;
+    }
+    int fd = open(MP_CATALOG_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) {
         return -1;
     }
-    int rc = write_all(fd, buf, len);
+    int rc = write_all(fd, s_hdr, CATALOG_HDR);
+    if (rc == 0) {
+        rc = write_all(fd, s_entries, (size_t)s_slot_cap * MP_ENTRY_SIZE);
+    }
     if (rc == 0 && fsync(fd) != 0) {
         rc = -1;
     }
@@ -199,15 +273,10 @@ static void sync_dir(void)
  *   1) 写 catalog.tmp + fsync；
  *   2) 旧 catalog.bin 改名 catalog.bak（保留上一版）；
  *   3) rename(catalog.tmp, catalog.bin)。
- * 任一步掉电，最坏留下 tmp + bak；load_catalog_locked() 会从它们恢复，
- * 不会再出现“写窗口内掉电就丢光 8 条目录”。 */
+ * 任一步掉电，最坏留下 tmp + bak；load_catalog_locked() 会从它们恢复。 */
 static int flush_catalog_locked(void)
 {
-    uint8_t buf[CATALOG_BYTES];
-    memcpy(buf, s_hdr, CATALOG_HDR);
-    memcpy(buf + CATALOG_HDR, s_entries, sizeof(s_entries));
-
-    if (write_file_sync(MP_CATALOG_TMP, buf, sizeof(buf)) != 0) {
+    if (write_catalog_tmp_sync() != 0) {
         set_err("catalog tmp write failed");
         return -1;
     }
@@ -235,21 +304,51 @@ static void set_font_flag(uint8_t v)
     s_hdr[5] = v;
 }
 
+/* 读取动态长度 catalog 文件：支持旧版 8 槽(264 B)以及任意扩容后的 N 槽目录。 */
 static int read_catalog_file(const char *path)
 {
-    uint8_t buf[CATALOG_BYTES];
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         return -1;
     }
-    bool ok = read_all(fd, buf, sizeof(buf)) == 0 && buf[0] == 'B' && buf[1] == 'O' &&
-              buf[2] == 'O' && buf[3] == 'K' && buf[4] == 0x01;
-    close(fd);
-    if (!ok) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)(CATALOG_HDR + MP_ENTRY_SIZE) ||
+        ((st.st_size - CATALOG_HDR) % MP_ENTRY_SIZE) != 0) {
+        close(fd);
         return -1;
     }
-    memcpy(s_hdr, buf, CATALOG_HDR);
-    memcpy(s_entries, buf + CATALOG_HDR, sizeof(s_entries));
+    uint64_t slots = (uint64_t)(st.st_size - CATALOG_HDR) / MP_ENTRY_SIZE;
+    if (slots == 0 || slots > MP_MAX_SLOTS) {
+        close(fd);
+        return -1;
+    }
+
+    uint8_t hdr[CATALOG_HDR];
+    if (read_all(fd, hdr, sizeof(hdr)) != 0 || hdr[0] != 'B' || hdr[1] != 'O' ||
+        hdr[2] != 'O' || hdr[3] != 'K' || hdr[4] != 0x01) {
+        close(fd);
+        return -1;
+    }
+
+    uint16_t cap = (uint16_t)slots;
+    uint8_t (*tmp)[MP_ENTRY_SIZE] =
+        (uint8_t (*)[MP_ENTRY_SIZE])malloc((size_t)cap * MP_ENTRY_SIZE);
+    if (!tmp) {
+        close(fd);
+        set_err("catalog oom");
+        return -1;
+    }
+    int rc = read_all(fd, tmp, (size_t)cap * MP_ENTRY_SIZE);
+    close(fd);
+    if (rc != 0) {
+        free(tmp);
+        return -1;
+    }
+
+    memcpy(s_hdr, hdr, CATALOG_HDR);
+    free(s_entries);
+    s_entries = tmp;
+    s_slot_cap = cap;
     return 0;
 }
 
@@ -258,15 +357,9 @@ static int read_catalog_file(const char *path)
  * 报给 app（PORT_SPEC §6.6-2）；-1 = 连重建都写不下去。 */
 static int load_catalog_locked(void)
 {
-    int fd = open(MP_CATALOG, O_RDONLY);
-    if (fd >= 0) {
-        uint8_t buf[CATALOG_BYTES];
-        bool ok = read_all(fd, buf, sizeof(buf)) == 0 && buf[0] == 'B' &&
-                  buf[1] == 'O' && buf[2] == 'O' && buf[3] == 'K' && buf[4] == 0x01;
-        close(fd);
-        if (ok) {
-            memcpy(s_hdr, buf, CATALOG_HDR);
-            memcpy(s_entries, buf + CATALOG_HDR, sizeof(s_entries));
+    struct stat st;
+    if (stat(MP_CATALOG, &st) == 0) {
+        if (read_catalog_file(MP_CATALOG) == 0) {
             return 0;
         }
         /* 存在但无效：改名保留现场，绝不 memset 覆盖（PORT_SPEC §6.6-2）。 */
@@ -291,17 +384,10 @@ static int load_catalog_locked(void)
             return -1;
         }
 
-        memset(s_hdr, 0, sizeof(s_hdr));
-        s_hdr[0] = 'B';
-        s_hdr[1] = 'O';
-        s_hdr[2] = 'O';
-        s_hdr[3] = 'K';
-        s_hdr[4] = 0x01;
-        memset(s_entries, 0xFF, sizeof(s_entries));
-        if (flush_catalog_locked() != 0) {
+        if (reset_empty_catalog_locked() != 0 || flush_catalog_locked() != 0) {
             return -1;
         }
-        ESP_LOGW(TAG, "catalog rebuilt: 8 empty slots");
+        ESP_LOGW(TAG, "catalog rebuilt: empty");
         return 1;
     }
 
@@ -316,14 +402,7 @@ static int load_catalog_locked(void)
         return 0;
     }
 
-    memset(s_hdr, 0, sizeof(s_hdr));
-    s_hdr[0] = 'B';
-    s_hdr[1] = 'O';
-    s_hdr[2] = 'O';
-    s_hdr[3] = 'K';
-    s_hdr[4] = 0x01;
-    memset(s_entries, 0xFF, sizeof(s_entries));
-    if (flush_catalog_locked() != 0) {
+    if (reset_empty_catalog_locked() != 0 || flush_catalog_locked() != 0) {
         return -1;
     }
     return 0;
@@ -363,7 +442,9 @@ int mp_store_init(void)
     if (!damaged) {
         (void)mp_settings_load();
         (void)mp_stats_load();
-        ESP_LOGI(TAG, "store ready: %d books", mp_store_count_done());
+        ESP_LOGI(TAG, "store ready: %u books (cap %u)",
+                 (unsigned)mp_store_count_done(),
+                 (unsigned)mp_store_slot_capacity());
     } else {
         ESP_LOGE(TAG, "store damaged: %s (storage error reported to app)",
                  mp_store_error());
@@ -376,13 +457,24 @@ const char *mp_store_error(void)
     return s_err;
 }
 
-int mp_store_count_done(void)
+uint16_t mp_store_slot_capacity(void)
 {
-    int n = 0;
+    uint16_t cap = 0;
     if (take() != 0) {
         return 0;
     }
-    for (int i = 0; i < MP_MAX_BOOKS; i++) {
+    cap = s_slot_cap;
+    give();
+    return cap;
+}
+
+uint16_t mp_store_count_done(void)
+{
+    uint16_t n = 0;
+    if (take() != 0) {
+        return 0;
+    }
+    for (uint16_t i = 0; i < s_slot_cap; i++) {
         if (s_entries[i][0] == MP_FLAG_DONE) {
             n++;
         }
@@ -391,16 +483,16 @@ int mp_store_count_done(void)
     return n;
 }
 
-int mp_store_list_done(uint8_t slots[MP_MAX_BOOKS])
+uint16_t mp_store_list_done(uint16_t *slots, uint16_t max_slots)
 {
-    int n = 0;
+    uint16_t n = 0;
     if (take() != 0) {
         return 0;
     }
-    for (int i = 0; i < MP_MAX_BOOKS; i++) {
+    for (uint16_t i = 0; i < s_slot_cap; i++) {
         if (s_entries[i][0] == MP_FLAG_DONE) {
-            if (slots && n < MP_MAX_BOOKS) {
-                slots[n] = (uint8_t)i;
+            if (slots && n < max_slots) {
+                slots[n] = i;
             }
             n++;
         }
@@ -409,19 +501,23 @@ int mp_store_list_done(uint8_t slots[MP_MAX_BOOKS])
     return n;
 }
 
-bool mp_store_is_done(uint8_t idx)
+bool mp_store_is_done(uint16_t idx)
 {
-    if (idx >= MP_MAX_BOOKS || take() != 0) {
+    if (take() != 0) {
         return false;
     }
-    bool ok = s_entries[idx][0] == MP_FLAG_DONE;
+    bool ok = (idx < s_slot_cap) && (s_entries[idx][0] == MP_FLAG_DONE);
     give();
     return ok;
 }
 
-int mp_store_read(uint8_t idx, mp_book_t *out)
+int mp_store_read(uint16_t idx, mp_book_t *out)
 {
-    if (!out || idx >= MP_MAX_BOOKS || take() != 0) {
+    if (!out || take() != 0) {
+        return -1;
+    }
+    if (idx >= s_slot_cap) {
+        give();
         return -1;
     }
     const uint8_t *e = s_entries[idx];
@@ -434,25 +530,36 @@ int mp_store_read(uint8_t idx, mp_book_t *out)
     return out->flags == MP_FLAG_DONE ? 0 : -1;
 }
 
-int mp_store_find_free_slot(void)
+int32_t mp_store_find_free_slot(void)
 {
-    int slot = -1;
+    int32_t slot = -1;
     if (take() != 0) {
         return -1;
     }
-    for (int i = 0; i < MP_MAX_BOOKS; i++) {
+    for (uint16_t i = 0; i < s_slot_cap; i++) {
         if (s_entries[i][0] != MP_FLAG_DONE && i != s_wslot) {
-            slot = i;
+            slot = (int32_t)i;
             break;
+        }
+    }
+    /* 现有槽已满时自动按 8 槽步进动态扩容，不再限制 8 本上限。 */
+    if (slot < 0 && s_slot_cap < MP_MAX_SLOTS) {
+        uint16_t next_slot = s_slot_cap;
+        if (ensure_slot_cap_locked((uint16_t)(next_slot + 1u)) == 0) {
+            slot = (int32_t)next_slot;
         }
     }
     give();
     return slot;
 }
 
-int mp_store_set_flag(uint8_t idx, uint8_t flags)
+int mp_store_set_flag(uint16_t idx, uint8_t flags)
 {
-    if (idx >= MP_MAX_BOOKS || take() != 0) {
+    if (idx >= MP_MAX_SLOTS || take() != 0) {
+        return -1;
+    }
+    if (idx >= s_slot_cap && ensure_slot_cap_locked((uint16_t)(idx + 1u)) != 0) {
+        give();
         return -1;
     }
     s_entries[idx][0] = flags;
@@ -461,9 +568,13 @@ int mp_store_set_flag(uint8_t idx, uint8_t flags)
     return rc;
 }
 
-int mp_store_begin(uint8_t idx, const char *title, uint32_t len, uint8_t enc)
+int mp_store_begin(uint16_t idx, const char *title, uint32_t len, uint8_t enc)
 {
-    if (idx >= MP_MAX_BOOKS || take() != 0) {
+    if (idx >= MP_MAX_SLOTS || take() != 0) {
+        return -1;
+    }
+    if (idx >= s_slot_cap && ensure_slot_cap_locked((uint16_t)(idx + 1u)) != 0) {
+        give();
         return -1;
     }
     if (s_wfd >= 0) {
@@ -474,9 +585,10 @@ int mp_store_begin(uint8_t idx, const char *title, uint32_t len, uint8_t enc)
                 enc == MP_ENC_GB2312 ? MP_ENC_GB2312 : MP_ENC_ASCII);
     int rc = flush_catalog_locked();
     if (rc == 0) {
-        char path[48];
+        char path[64];
         book_path(idx, path, sizeof(path));
         (void)unlink(path);
+        mp_toc_delete(idx);
         s_wfd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
         if (s_wfd < 0) {
             set_err("book open failed");
@@ -493,9 +605,9 @@ int mp_store_begin(uint8_t idx, const char *title, uint32_t len, uint8_t enc)
     return rc;
 }
 
-int mp_store_write(uint8_t idx, uint32_t off, const void *buf, size_t len)
+int mp_store_write(uint16_t idx, uint32_t off, const void *buf, size_t len)
 {
-    if (!buf || idx >= MP_MAX_BOOKS || take() != 0) {
+    if (!buf || idx >= MP_MAX_SLOTS || take() != 0) {
         return -1;
     }
     int rc = -1;
@@ -517,13 +629,13 @@ int mp_store_write(uint8_t idx, uint32_t off, const void *buf, size_t len)
     return rc;
 }
 
-int mp_store_set_chars(uint8_t idx, uint32_t chars)
+int mp_store_set_chars(uint16_t idx, uint32_t chars)
 {
-    if (idx >= MP_MAX_BOOKS || take() != 0) {
+    if (idx >= MP_MAX_SLOTS || take() != 0) {
         return -1;
     }
     int rc = -1;
-    if (s_wfd >= 0 && s_wslot == idx) {
+    if (s_wfd >= 0 && s_wslot == idx && idx < s_slot_cap) {
         uint32_t k = (chars + 1023u) / 1024u;
         if (k > 0xFFFFu) {
             k = 0xFFFFu;
@@ -539,13 +651,13 @@ int mp_store_set_chars(uint8_t idx, uint32_t chars)
     return rc;
 }
 
-int mp_store_finish(uint8_t idx)
+int mp_store_finish(uint16_t idx)
 {
-    if (idx >= MP_MAX_BOOKS || take() != 0) {
+    if (idx >= MP_MAX_SLOTS || take() != 0) {
         return -1;
     }
     int rc = -1;
-    if (s_wfd >= 0 && s_wslot == idx) {
+    if (s_wfd >= 0 && s_wslot == idx && idx < s_slot_cap) {
         struct stat st;
         bool ok = false;
         if (s_wwritten != s_wdeclared) {
@@ -564,7 +676,7 @@ int mp_store_finish(uint8_t idx)
             set_err("book finish: close failed");
         }
         s_wfd = -1;
-        s_wslot = 0xFF;
+        s_wslot = MP_SLOT_INVALID;
         s_wdeclared = 0;
         s_wwritten = 0;
         if (ok) {
@@ -579,7 +691,7 @@ int mp_store_finish(uint8_t idx)
             }
         } else {
             /* 长度不符/写失败：按 abort 处理，不留半本书（§6.6-1）。 */
-            char path[48];
+            char path[64];
             book_path(idx, path, sizeof(path));
             (void)unlink(path);
             memset(s_entries[idx], 0, MP_ENTRY_SIZE);
@@ -592,41 +704,49 @@ int mp_store_finish(uint8_t idx)
     return rc;
 }
 
-void mp_store_abort(uint8_t idx)
+void mp_store_abort(uint16_t idx)
 {
-    if (idx >= MP_MAX_BOOKS || take() != 0) {
+    if (idx >= MP_MAX_SLOTS || take() != 0) {
         return;
     }
     if (s_wfd >= 0 && s_wslot == idx) {
         close(s_wfd);
         s_wfd = -1;
-        s_wslot = 0xFF;
+        s_wslot = MP_SLOT_INVALID;
         s_wdeclared = 0;
         s_wwritten = 0;
-        char path[48];
+        char path[64];
         book_path(idx, path, sizeof(path));
         (void)unlink(path);
-        s_entries[idx][0] = MP_FLAG_EMPTY;
-        (void)flush_catalog_locked();
+        mp_toc_delete(idx);
+        if (idx < s_slot_cap) {
+            s_entries[idx][0] = MP_FLAG_EMPTY;
+            (void)flush_catalog_locked();
+        }
     }
     give();
 }
 
-int mp_store_delete(uint8_t idx)
+int mp_store_delete(uint16_t idx)
 {
-    if (idx >= MP_MAX_BOOKS || take() != 0) {
+    if (idx >= MP_MAX_SLOTS || take() != 0) {
+        return -1;
+    }
+    if (idx >= s_slot_cap) {
+        give();
         return -1;
     }
     if (s_wfd >= 0 && s_wslot == idx) {
         close(s_wfd);
         s_wfd = -1;
-        s_wslot = 0xFF;
+        s_wslot = MP_SLOT_INVALID;
         s_wdeclared = 0;
         s_wwritten = 0;
     }
-    char path[48];
+    char path[64];
     book_path(idx, path, sizeof(path));
     (void)unlink(path);
+    mp_toc_delete(idx);
     memset(s_entries[idx], 0, MP_ENTRY_SIZE);
     s_entries[idx][0] = MP_FLAG_DELETED;
     int rc = flush_catalog_locked();
@@ -640,24 +760,42 @@ int mp_store_compact(void)
     if (take() != 0) {
         return -1;
     }
-    for (int i = 0; i < MP_MAX_BOOKS; i++) {
+    uint32_t active_end = 0;
+    for (uint16_t i = 0; i < s_slot_cap; i++) {
         uint8_t f = s_entries[i][0];
         if (f != MP_FLAG_DONE && f != MP_FLAG_EMPTY) {
             memset(s_entries[i], 0, MP_ENTRY_SIZE);
             s_entries[i][0] = MP_FLAG_EMPTY;
         }
+        if (s_entries[i][0] == MP_FLAG_DONE) {
+            active_end = (uint32_t)i + 1u;
+        }
+    }
+    /* 收缩尾部连续空槽至最小 8 的倍数，保持目录文件精简。 */
+    uint16_t target_cap = align_slot_cap(active_end);
+    if (target_cap < s_slot_cap) {
+        uint8_t (*shrunk)[MP_ENTRY_SIZE] =
+            (uint8_t (*)[MP_ENTRY_SIZE])realloc(s_entries, (size_t)target_cap * MP_ENTRY_SIZE);
+        if (shrunk) {
+            s_entries = shrunk;
+        }
+        s_slot_cap = target_cap;
     }
     int rc = flush_catalog_locked();
     give();
     return rc;
 }
 
-int mp_store_read_book(uint8_t idx, uint32_t off, void *buf, size_t len)
+int mp_store_read_book(uint16_t idx, uint32_t off, void *buf, size_t len)
 {
-    if (!buf || idx >= MP_MAX_BOOKS || take() != 0) {
+    if (!buf || idx >= MP_MAX_SLOTS || take() != 0) {
         return -1;
     }
-    char path[48];
+    if (idx >= s_slot_cap) {
+        give();
+        return -1;
+    }
+    char path[64];
     book_path(idx, path, sizeof(path));
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -674,11 +812,11 @@ int mp_store_read_book(uint8_t idx, uint32_t off, void *buf, size_t len)
     return rc;
 }
 
-uint32_t mp_store_book_size(uint8_t idx)
+uint32_t mp_store_book_size(uint16_t idx)
 {
     mp_book_t b;
     struct stat st;
-    char path[48];
+    char path[64];
 
     if (mp_store_read(idx, &b) != 0) {
         return 0;
@@ -970,9 +1108,9 @@ static uint8_t prog_xor(const uint8_t *r)
     return x;
 }
 
-int mp_progress_save(uint8_t idx, uint32_t pos)
+int mp_progress_save(uint16_t idx, uint32_t pos)
 {
-    if (idx >= MP_MAX_BOOKS || take() != 0) {
+    if (idx >= MP_MAX_SLOTS || take() != 0) {
         return -1;
     }
     int fd = open(MP_PROGRESS, O_RDWR | O_CREAT, 0666);
@@ -983,8 +1121,9 @@ int mp_progress_save(uint8_t idx, uint32_t pos)
         uint8_t r[8];
         memset(r, 0, sizeof(r));
         r[0] = 0x5A;
-        r[1] = idx;
+        r[1] = (uint8_t)(idx & 0xFFu);
         wr_le32(&r[2], pos);
+        r[6] = (uint8_t)((idx >> 8) & 0xFFu);
         r[7] = prog_xor(r);
         if (lseek(fd, (off_t)idx * 8, SEEK_SET) >= 0 &&
             write_all(fd, r, sizeof(r)) == 0) {
@@ -997,9 +1136,9 @@ int mp_progress_save(uint8_t idx, uint32_t pos)
     return rc;
 }
 
-bool mp_progress_load(uint8_t idx, uint32_t *pos)
+bool mp_progress_load(uint16_t idx, uint32_t *pos)
 {
-    if (idx >= MP_MAX_BOOKS || !pos || take() != 0) {
+    if (idx >= MP_MAX_SLOTS || !pos || take() != 0) {
         return false;
     }
     int fd = open(MP_PROGRESS, O_RDONLY);
@@ -1008,7 +1147,9 @@ bool mp_progress_load(uint8_t idx, uint32_t *pos)
         uint8_t r[8];
         ok = lseek(fd, (off_t)idx * 8, SEEK_SET) >= 0 &&
              read_all(fd, r, sizeof(r)) == 0 && r[0] == 0x5A &&
-             r[1] == idx && r[7] == prog_xor(r);
+             r[1] == (uint8_t)(idx & 0xFFu) &&
+             r[6] == (uint8_t)((idx >> 8) & 0xFFu) &&
+             r[7] == prog_xor(r);
         close(fd);
         if (ok) {
             *pos = rd_le32(&r[2]);
@@ -1164,6 +1305,91 @@ int mp_stats_save(void)
             rc = 0;
         }
         close(fd);
+    }
+    give();
+    return rc;
+}
+
+/* ---- clock snapshot ---- */
+
+static bool clock_read_file(const char *path, uint32_t *out)
+{
+    uint8_t buf[16];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = read_all(fd, buf, sizeof(buf)) == 0 &&
+              buf[0] == CLOCK_MAGIC0 && buf[1] == CLOCK_MAGIC1 &&
+              buf[2] == CLOCK_MAGIC2 && buf[3] == CLOCK_MAGIC3 &&
+              buf[15] == settings_crc(buf, 15);
+    close(fd);
+    if (!ok) {
+        return false;
+    }
+    uint32_t ux = rd_le32(&buf[4]);
+    uint32_t inv = rd_le32(&buf[8]);
+    if ((ux ^ inv) != 0xFFFFFFFFu) {
+        return false;
+    }
+    *out = ux;
+    return true;
+}
+
+bool mp_clock_load(uint32_t *unix_s)
+{
+    if (!unix_s || take() != 0) {
+        return false;
+    }
+    uint32_t ux = 0;
+    bool ok = clock_read_file(MP_CLOCK, &ux) || clock_read_file(MP_CLOCK_BAK, &ux);
+    give();
+    if (ok) {
+        *unix_s = ux;
+    }
+    return ok;
+}
+
+int mp_clock_save(uint32_t unix_s)
+{
+    uint8_t buf[16];
+    if (take() != 0) {
+        return -1;
+    }
+    memset(buf, 0, sizeof(buf));
+    buf[0] = CLOCK_MAGIC0;
+    buf[1] = CLOCK_MAGIC1;
+    buf[2] = CLOCK_MAGIC2;
+    buf[3] = CLOCK_MAGIC3;
+    wr_le32(&buf[4], unix_s);
+    wr_le32(&buf[8], ~unix_s);
+    buf[15] = settings_crc(buf, 15);
+
+    int rc = -1;
+    int fd = open(MP_CLOCK_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) {
+        if (write_all(fd, buf, sizeof(buf)) == 0 && fsync(fd) == 0) {
+            rc = 0;
+        }
+        if (close(fd) != 0) {
+            rc = -1;
+        }
+    }
+    if (rc == 0) {
+        (void)unlink(MP_CLOCK_BAK);
+        struct stat st;
+        if (stat(MP_CLOCK, &st) == 0) {
+            (void)rename(MP_CLOCK, MP_CLOCK_BAK);
+        }
+        if (rename(MP_CLOCK_TMP, MP_CLOCK) != 0) {
+            (void)rename(MP_CLOCK_BAK, MP_CLOCK);
+            (void)unlink(MP_CLOCK_TMP);
+            rc = -1;
+        } else {
+            sync_dir();
+        }
+    } else {
+        (void)unlink(MP_CLOCK_TMP);
     }
     give();
     return rc;

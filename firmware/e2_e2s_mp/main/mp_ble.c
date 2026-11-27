@@ -453,10 +453,10 @@ static int chr_main_access(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     uint8_t op = pkt[0];
-    /* 路由：只有首字节在 0x10..0x44 的写才到应用层（ble.c:195）。
-     * 其它首字节在参考固件里会掉进 OTA 分支；本工程没有 OTA，直接忽略
-     * （PORT_SPEC §7.3 的"本工程不新增 op"）。 */
-    if (op < MP_BLE_OP_MIN || op > MP_BLE_OP_MAX) {
+    /* 路由：放行 0x10..0x44 原版 Miaopaper 协议以及 0x50..0x54 固件原地自更新协议。 */
+    bool op_ok = (op >= MP_BLE_OP_MIN && op <= MP_BLE_OP_MAX) ||
+                 (op >= MP_OP_OTA_INFO && op <= MP_OP_OTA_ABORT);
+    if (!op_ok) {
         return 0;
     }
 
