@@ -323,9 +323,9 @@ public final class A5Protocol {
             Exchange exchange = session.exchange();
             int rawBattery = intValue(query(exchange, 11));
             int battery = rawBattery / 10;
-            if (rawBattery < 0 || battery < 50) {
+            if (rawBattery < 0 || battery < 20) {
                 return new Result(Outcome.FLASH_BLOCKED,
-                        "电量 " + battery + "%，需 ≥50%");
+                        "电量 " + battery + "%，需 ≥20%");
             }
             int maxLen = intValue(query(exchange, 20));
             if (maxLen < 200 || maxLen > 5000) {

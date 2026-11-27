@@ -51,7 +51,11 @@
 !/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/
 !/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/A5Flasher.java
 !/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/A5Protocol.java
+!/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/LockImageEditor.kt
 !/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/MainActivity.kt
+!/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/ReaderOtaFlasher.java
+!/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/ReaderTransfer.java
+!/app/E2SFlash/app/src/main/java/com/zxg/miaopaperflash/TransferMedia.kt
 
 !/app/E2SFlash/app/src/main/res/
 !/app/E2SFlash/app/src/main/res/values/

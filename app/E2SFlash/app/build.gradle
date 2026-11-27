@@ -18,8 +18,8 @@ android {
         applicationId "com.zxg.miaopaperflash"
         minSdk 26
         targetSdk 34
-        versionCode 37
-        versionName "1.1"
+        versionCode 38
+        versionName "1.2"
     }
     signingConfigs {
         release {
