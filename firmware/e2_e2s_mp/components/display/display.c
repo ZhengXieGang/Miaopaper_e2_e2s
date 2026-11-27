@@ -7,13 +7,16 @@
  *   - s_work 只由 display 任务读写:任务在锁内把 s_pending 拷到 s_work 后
  *     立刻放锁,再调用 epd_draw_ex();只有 display 任务碰面板。
  *
- * 全刷点(DESIGN §4.4):冷启动首帧、打开书(调用方 post FULL)、手动
- * (display_request_full / FUNC 长按 / BLE 0x40)、GC、刷新失败后的单次自愈。
- * 其余都是局刷。局刷之后的第一次全刷至少间隔 READER_GC_MIN_GAP_MS
- * (5 s);边界处若 GC 待办且间隔不足则降级局刷并保留 pending。
- * GC 在**全刷启动时**就清 gc_pending(D9),避免 GC 全刷(~1.3 s)期间 app
- * 读到"待办+间隔足够"又把下一帧标成 FULL;GC 完成后 5 s 内到达的非强制
- * FULL 也降级为局刷(D4),两道闸一起保证不会出现 GC 全刷紧接第二次全刷。
+ * 全刷点(DESIGN §4.4):冷启动首帧、锁屏/解锁回阅读/错误页(DISPLAY_MODE_FULL)、
+ * 手动(display_request_full / ▭ 键 / BLE 0x40)、周期页内合并 GC、刷新失败后的单次自愈。
+ *
+ * 自动 GC 策略:
+ *   - 取消空闲定时原地全刷，避免静读中途突然黑闪或与自动锁屏撞车双全刷；
+ *   - 常规页(DISPLAY_MODE_AUTO)连续局刷到第 gc_partials 帧本身(或此前已挂起 gc_pending)
+ *     时，当次直接合并为一次全刷(why="gc_page")，翻到新页立即干净且零额外闪烁；
+ *   - 交互微调页(DISPLAY_MODE_PARTIAL)暂缓自动 GC 全刷，仅正常局刷并累加计数/标记
+ *     gc_pending，待用户退出微调页或回到常规页时再合并清残影；
+ *   - 全刷启动即清 gc_pending(D9)，防止全刷期间到达的新帧重复全刷。
  */
 #include "display.h"
 
@@ -62,8 +65,6 @@ static display_mode_t s_mode;    /* 该帧的请求模式 */
 static bool s_force_full;        /* display_request_full() 的一次性请求 */
 static bool s_heal_pending;      /* 刷新失败后的单次全刷自愈 */
 static bool s_busy;              /* display 任务正在刷面板 */
-static bool s_attempted;         /* 至少完成过一次刷新尝试 */
-static uint32_t s_last_refresh_ms; /* 上一次刷新尝试的结束时刻(开机毫秒) */
 
 static uint32_t now_ms(void)
 {
@@ -74,23 +75,20 @@ static uint32_t now_ms(void)
 typedef struct {
     bool draw;
     bool full;
-    bool use_work;      /* 无新帧:重刷 s_work(GC / 手动 / 自愈) */
+    bool use_work;      /* 无新帧:重刷 s_work(手动 / 自愈) */
     bool is_heal;       /* 这是失败后的自愈重试,失败后不再自动重试 */
-    bool is_gc;         /* 本次全刷属于自动清残影 */
+    bool is_gc;         /* 本次全刷属于周期页内合并清残影 */
     const char *why;
 } refresh_plan_t;
 
 /* 选择本次动作。只看状态,不改状态、不拷帧。所有分支均无阻塞等待。 */
 static void plan_refresh(refresh_plan_t *p)
 {
-    const uint32_t now = now_ms();
     const bool has_frame = s_stats.frames > 0;
     const bool baseline = s_stats.baseline_valid;
     const bool non_boe = s_stats.family != 1;
     const bool gc_pending = s_stats.gc_pending;
     const bool force = s_force_full;
-    const uint32_t since = s_attempted ? (uint32_t)(now - s_last_refresh_ms)
-                                       : READER_GC_MIN_GAP_MS;
 
     memset(p, 0, sizeof(*p));
 
@@ -120,9 +118,10 @@ static void plan_refresh(refresh_plan_t *p)
             return;
         }
 
-        /* 累计局刷满阈值且未切强刷时,在下一次新帧绘制直接一步合并成全刷,
-         * 既消残影又不触发操作后突发卡顿或闪两遍。 */
-        if (gc_pending && s_mode == DISPLAY_MODE_AUTO && s_stats.gc_partials != 0) {
+        /* 常规页(DISPLAY_MODE_AUTO)连续局刷满阈值(含本次正好满第 N 次)或已有暂缓待办时,
+         * 当次直接合并成一次全刷一步清残影;交互微调页(DISPLAY_MODE_PARTIAL)跳过自动 GC。 */
+        if (s_mode == DISPLAY_MODE_AUTO && s_stats.gc_partials != 0 &&
+            (gc_pending || (s_stats.partial_since_full + 1u) >= s_stats.gc_partials)) {
             p->draw = true;
             p->full = true;
             p->is_gc = true;
@@ -140,28 +139,13 @@ static void plan_refresh(refresh_plan_t *p)
     if (!has_frame)
         return;
 
-    /* 4) 手动全刷:立即重刷当前 s_work。 */
+    /* 4) 手动全刷:立即重刷当前 s_work。不再执行空闲定时原地突袭全刷。 */
     if (force) {
         p->draw = true;
         p->full = true;
         p->use_work = true;
         p->why = "manual";
         return;
-    }
-
-    /* 5) 空闲自动 GC:用户停留在同一页超过 idle_ms 后再后台清残影,
-     * 等待期间可随时被新帧唤醒打断。 */
-    if (gc_pending && baseline && s_stats.gc_partials != 0) {
-        uint32_t idle = s_stats.gc_idle_ms;
-        if (idle < READER_GC_MIN_GAP_MS)
-            idle = READER_GC_MIN_GAP_MS;
-        if (since >= idle) {
-            p->draw = true;
-            p->full = true;
-            p->use_work = true;
-            p->is_gc = true;
-            p->why = "gc";
-        }
     }
 }
 
@@ -170,8 +154,6 @@ static void plan_refresh(refresh_plan_t *p)
 static void stats_update(const refresh_plan_t *p, int err, uint32_t ms, uint32_t end_ms)
 {
     const uint32_t now = end_ms;
-    s_last_refresh_ms = now;
-    s_attempted = true;
     s_busy = false;
     s_stats.last_ms = now;
     s_stats.last_err = err;
@@ -224,8 +206,6 @@ static void display_task(void *arg)
     (void)arg;
     for (;;) {
         refresh_plan_t plan;
-        bool wait_forever = true;
-        uint32_t wake_wait_ms = 0;
 
         xSemaphoreTake(s_lock, portMAX_DELAY);
         if (s_sleeping) {
@@ -245,30 +225,12 @@ static void display_task(void *arg)
                 s_stats.gc_pending = false;
             }
             s_busy = true;
-        } else if (!s_sleeping && s_stats.frames > 0 && s_stats.gc_pending &&
-                   s_stats.baseline_valid && s_stats.gc_partials != 0) {
-            /* 有待办空闲 GC 时按精确到期毫秒等待；等待期间可随时被新帧打断。 */
-            uint32_t idle = s_stats.gc_idle_ms;
-            if (idle < READER_GC_MIN_GAP_MS) {
-                idle = READER_GC_MIN_GAP_MS;
-            }
-            uint32_t since = s_attempted ? (uint32_t)(now_ms() - s_last_refresh_ms)
-                                         : idle;
-            wake_wait_ms = (since >= idle) ? 50u : (idle - since);
-            wait_forever = false;
         }
         xSemaphoreGive(s_lock);
 
         if (!plan.draw) {
-            if (wait_forever) {
-                xSemaphoreTake(s_wake, portMAX_DELAY);
-            } else {
-                TickType_t ticks = pdMS_TO_TICKS(wake_wait_ms);
-                if (ticks == 0) {
-                    ticks = 1;
-                }
-                xSemaphoreTake(s_wake, ticks);
-            }
+            /* 无待绘制帧时彻底挂起等待新帧或手动全刷唤醒，零空闲定时唤醒。 */
+            xSemaphoreTake(s_wake, portMAX_DELAY);
             continue;
         }
 
@@ -305,7 +267,7 @@ int display_init(void)
 
     memset(&s_stats, 0, sizeof(s_stats));
     s_stats.gc_partials = READER_GC_PARTIALS;
-    s_stats.gc_idle_ms = (uint16_t)READER_GC_IDLE_MS;
+    s_stats.gc_idle_ms = 0;
 
     s_lock = xSemaphoreCreateMutex();
     s_wake = xSemaphoreCreateBinary();

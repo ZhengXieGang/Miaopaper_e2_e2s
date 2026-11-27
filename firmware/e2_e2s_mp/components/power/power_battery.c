@@ -19,12 +19,15 @@
  *   3800 mV → pct 54 → 正常
  */
 #include "power.h"
+#include "power_filter.h"
 
 #include "board.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "sdkconfig.h"
 #ifdef CONFIG_PM_ENABLE
 #include "esp_pm.h"
@@ -38,9 +41,6 @@ static const char *TAG = "power";
 
 #define ADC_SAMPLES 8
 #define VBAT_MAX_MV 4300          /* 超过视为分压/采样异常(§10.1) */
-#define BAT_EMPTY_MV 3500         /* pct 0 的电池电压 */
-#define BAT_SPAN_MV 600           /* 3500..4100 → 0..100 */
-#define BAT_OFFSET_MV 25          /* pct = (Vbat + 25 - 3500) × 100 / 600 */
 
 /* GPIO5 内部上拉:**推断值,需真机确认**。盘点 §8.5 没有给出该脚的外部电路,
  * 这里开内部上拉只是为了让“悬空(未接充电器)”读出确定的高电平 = 未充电;
@@ -59,6 +59,12 @@ static const char *TAG = "power";
 static power_status_t s_status;
 static uint16_t s_hist_mv;        /* 上一份合理读数,用于 vbat>4300 时沿用 */
 static bool s_hist_valid;
+RTC_DATA_ATTR static power_filter_rtc_t s_bat_rtc; /* 跨深睡持久化的电量防抖滤波状态 */
+static power_filter_run_t s_bat_run;               /* 单次开机周期内的插拔与步进时间戳 */
+static volatile bool s_chg_irq_pending; /* GPIO5 充电电平翻转中断待处理标志 */
+static bool s_chg_irq_ok;         /* GPIO5 中断与轻睡唤醒是否已就绪 */
+static bool s_chg_armed_state;    /* 当前中断/轻睡唤醒所对应的稳定充电状态 */
+static void (*s_charge_wake_cb)(void);
 #ifdef CONFIG_PM_ENABLE
 static esp_pm_lock_handle_t s_pm_lock; /* 采样分压期间禁止自动轻睡 */
 #endif
@@ -68,17 +74,72 @@ static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_cali;
 #endif
 
-static uint8_t battery_percent(int vbat_mv)
-{
-    int v = vbat_mv + BAT_OFFSET_MV;
-    int pct = (v - BAT_EMPTY_MV) * 100 / BAT_SPAN_MV;
-    return (uint8_t)rc_clamp(pct, 0, 100);
-}
-
 static bool charge_detect(void)
 {
     /* 低 = charging;开内部上拉,悬空(无充电器)时读出确定的高电平。 */
     return gpio_get_level(BOARD_CHARGE_DET_GPIO) == 0;
+}
+
+/* GPIO5 电平翻转中断服务函数：立即禁中断防止电平抖动风暴，并唤醒应用任务防抖确认。 */
+static void IRAM_ATTR charge_isr(void *arg)
+{
+    (void)arg;
+    gpio_intr_disable((gpio_num_t)BOARD_CHARGE_DET_GPIO);
+    s_chg_irq_pending = true;
+    void (*cb)(void) = s_charge_wake_cb;
+    if (cb) {
+        cb();
+    }
+}
+
+/* 按当前稳定充电状态装填反相电平中断与自动轻睡唤醒：
+ *   - 未充电(高电平)：监听 LOW_LEVEL，插入充电器瞬间唤醒；
+ *   - 充电中(低电平)：监听 HIGH_LEVEL，避免插电时阻止自动轻睡且拔出瞬间唤醒。 */
+static void charge_irq_arm(bool cur_charging)
+{
+    if (!s_chg_irq_ok) {
+        return;
+    }
+    gpio_int_type_t want =
+        cur_charging ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
+    (void)gpio_intr_disable((gpio_num_t)BOARD_CHARGE_DET_GPIO);
+    (void)gpio_wakeup_enable((gpio_num_t)BOARD_CHARGE_DET_GPIO, want);
+    s_chg_armed_state = cur_charging;
+    (void)gpio_intr_enable((gpio_num_t)BOARD_CHARGE_DET_GPIO);
+}
+
+void power_set_charge_wake_cb(void (*cb)(void))
+{
+    s_charge_wake_cb = cb;
+    if (cb && s_chg_irq_pending) {
+        cb();
+    }
+}
+
+bool power_charge_poll(bool *changed)
+{
+    bool prev = s_status.charging;
+    if (s_chg_irq_pending) {
+        s_chg_irq_pending = false;
+        /* 对齐官方 pm_charge_event_send 防抖逻辑，跳过 USB-C 插拔瞬间抖动。 */
+        vTaskDelay(pdMS_TO_TICKS(30));
+        bool now = charge_detect();
+        s_status.charging = now;
+        charge_irq_arm(now);
+    } else {
+        bool now = charge_detect();
+        if (now != s_status.charging ||
+            (s_chg_irq_ok && now != s_chg_armed_state)) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            now = charge_detect();
+            s_status.charging = now;
+            charge_irq_arm(now);
+        }
+    }
+    if (changed) {
+        *changed = (s_status.charging != prev);
+    }
+    return s_status.charging;
 }
 
 #if READER_ADC_OVERRIDE_MV <= 0
@@ -158,7 +219,12 @@ static void apply_vbat(int vbat_mv)
     }
 
     s_status.mv = (uint16_t)vbat_mv;
-    s_status.percent = battery_percent(vbat_mv);
+#if READER_ADC_OVERRIDE_MV > 0
+    s_status.percent = power_filter_raw_percent(vbat_mv);
+#else
+    s_status.percent = power_filter_update(&s_bat_rtc, &s_bat_run, vbat_mv,
+                                           s_status.charging, rc_now_ms());
+#endif
     s_status.valid = true;
     s_hist_mv = (uint16_t)vbat_mv;
     s_hist_valid = true;
@@ -169,6 +235,7 @@ int power_init(void)
     s_status = (power_status_t){0};
     s_hist_mv = 0;
     s_hist_valid = false;
+    power_filter_boot_init(&s_bat_rtc, &s_bat_run);
 
     /* GPIO45:采样窗口使能,平时保持 0(红线:GPIO45 只瞬时置 1)。 */
     gpio_config_t en_cfg = {
@@ -202,6 +269,28 @@ int power_init(void)
         return (int)err;
     }
     s_status.charging = charge_detect();
+    s_chg_irq_pending = false;
+    s_chg_irq_ok = false;
+
+    /* 注册 GPIO5 充电插拔硬件中断与轻睡唤醒（对齐官方 battery_charge_ping_irq_register）；
+     * 若 ISR 服务不可用则自动退化为轮询检测。 */
+    esp_err_t ierr = gpio_install_isr_service(0);
+    if (ierr == ESP_OK || ierr == ESP_ERR_INVALID_STATE) {
+        (void)gpio_isr_handler_remove((gpio_num_t)BOARD_CHARGE_DET_GPIO);
+        if (gpio_isr_handler_add((gpio_num_t)BOARD_CHARGE_DET_GPIO, charge_isr,
+                                 NULL) == ESP_OK &&
+            esp_sleep_enable_gpio_wakeup() == ESP_OK) {
+            s_chg_irq_ok = true;
+            charge_irq_arm(s_status.charging);
+            ESP_LOGI(TAG, "charge detect IRQ ready on GPIO%d (charging=%d)",
+                     BOARD_CHARGE_DET_GPIO, (int)s_status.charging);
+        } else {
+            ESP_LOGW(TAG, "charge detect IRQ setup incomplete; using poll fallback");
+        }
+    } else {
+        ESP_LOGW(TAG, "gpio_install_isr_service failed: %s; charge poll fallback",
+                 esp_err_to_name(ierr));
+    }
 
 #if READER_ADC_OVERRIDE_MV > 0
     ESP_LOGW(TAG, "READER_ADC_OVERRIDE_MV=%d: ADC path disabled (acceptance build)",
@@ -228,7 +317,11 @@ int power_init(void)
 
 void power_sample(void)
 {
-    s_status.charging = charge_detect();
+    bool chg = charge_detect();
+    s_status.charging = chg;
+    if (s_chg_irq_ok && !s_chg_irq_pending && chg != s_chg_armed_state) {
+        charge_irq_arm(chg);
+    }
 
 #if READER_ADC_OVERRIDE_MV > 0
     /* 验收路径:跳过 ADC 与 GPIO45,直接把宏值当作电池 mV。
@@ -263,6 +356,8 @@ void power_sample(void)
     vTaskDelay(pdMS_TO_TICKS(READER_ADC_SETTLE_MS));
 
     int sum = 0;
+    int min_mv = 0;
+    int max_mv = 0;
     int n = 0;
     for (int i = 0; i < ADC_SAMPLES; i++) {
         int raw = 0;
@@ -276,6 +371,17 @@ void power_sample(void)
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "adc_cali_raw_to_voltage failed: %s", esp_err_to_name(err));
             continue;
+        }
+        if (n == 0) {
+            min_mv = mv;
+            max_mv = mv;
+        } else {
+            if (mv < min_mv) {
+                min_mv = mv;
+            }
+            if (mv > max_mv) {
+                max_mv = mv;
+            }
         }
         sum += mv;
         n++;
@@ -296,14 +402,19 @@ void power_sample(void)
         return;
     }
 
-    int pin_mv = (sum + n / 2) / n;
+    /* 有效采样数 >= 4 时去掉 1 个最高毛刺与 1 个最低毛刺再取四舍五入均值。 */
+    int pin_mv = (n >= 4)
+                     ? ((sum - min_mv - max_mv + (n - 2) / 2) / (n - 2))
+                     : ((sum + n / 2) / n);
     int vbat_mv = pin_mv * 2;
     /* 先记本次分压点读数,再套门限:apply_vbat() 可能因 vbat>4300 沿用历史
      * 值,那时 pin_mv 仍应反映本次真实采样(§15 #16 要与万用表比对)。 */
     s_status.pin_mv = (uint32_t)pin_mv;
     apply_vbat(vbat_mv);
-    ESP_LOGI(TAG, "adc pin=%d mV vbat=%d mV pct=%u%% valid=%d charging=%d", pin_mv,
-             s_status.mv, s_status.percent, s_status.valid, s_status.charging);
+    ESP_LOGI(TAG, "adc pin=%d mV vbat=%d mV raw=%u%% pct=%u%% off=%u mV valid=%d charging=%d",
+             pin_mv, s_status.mv, power_filter_raw_percent(s_status.mv),
+             s_status.percent, (unsigned)s_bat_rtc.chg_offset_mv,
+             s_status.valid, s_status.charging);
 #endif /* READER_ADC_OVERRIDE_MV > 0 */
 }
 

@@ -599,6 +599,23 @@ void epd_deep_sleep(void)
         esp_err_t e2 = wdata(&d, 1);
         ESP_LOGI(TAG, "epd deep sleep OED err=%d/%d", (int)e1, (int)e2);
     }
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    /* 对齐原厂 epd_hal_spi_deinit：释放 SPI 总线，避免深睡期高电平驱动向面板倒灌电流。 */
+    (void)spi_bus_remove_device(s_spi);
+    s_spi = NULL;
+    (void)spi_bus_free(SPI3_HOST);
+    s_init_ok = 0;
+
+    static const gpio_num_t epd_pins[] = {
+        (gpio_num_t)EPD_PIN_CS,   (gpio_num_t)EPD_PIN_DC,
+        (gpio_num_t)EPD_PIN_RST,  (gpio_num_t)EPD_PIN_BUSY,
+        (gpio_num_t)EPD_PIN_MOSI, (gpio_num_t)EPD_PIN_SCLK,
+    };
+    for (size_t i = 0; i < sizeof(epd_pins) / sizeof(epd_pins[0]); i++) {
+        (void)gpio_reset_pin(epd_pins[i]);
+        (void)gpio_set_pull_mode(epd_pins[i], GPIO_FLOATING);
+    }
 }
 
 void epd_diag(char *out, int n)

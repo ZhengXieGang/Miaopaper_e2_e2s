@@ -7,8 +7,8 @@
  */
 
 #define READER_VERSION_MAJOR 1
-#define READER_VERSION_MINOR 0
-#define READER_VERSION_PATCH 3
+#define READER_VERSION_MINOR 2
+#define READER_VERSION_PATCH 0
 
 /* Logical frame: 250x122, 1bpp, row stride 32 B, MSB left, 1=white 0=black
  * (DESIGN §4.1; same convention as badapple/main/playback.c:167). */
