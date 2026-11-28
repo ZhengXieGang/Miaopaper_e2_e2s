@@ -40,7 +40,7 @@
 #define MP_BLE_SVC_DEVI 0x180A
 #define MP_BLE_CHR_PNP 0x2A50    /* PnP ID，7 B，内容同 app_att.c:60 */
 
-/* 扫描响应名（固定，不含身份信息）。 */
+/* 广播与扫描响应设备名（固定，不含身份信息）。 */
 #define MP_BLE_NAME "MPP_E2S"
 #define MP_BLE_NAME_LEN 7
 
@@ -56,7 +56,7 @@
                                      * 一块外必须回满 160；需要 MTU>=166。 */
 #define MP_BLE_FONT_BYTES 261696u   /* 87*94*32 */
 #define MP_BLE_NOTIFY_STEP 256u     /* 0x11/0x17 每累计 256 B 回一次水位 */
-#define MP_BLE_ADV_ITVL 1600        /* 1600 × 0.625 ms = 1.0 s（ble.c:266） */
+#define MP_BLE_ADV_ITVL 480         /* 480 × 0.625 ms = 300 ms，兼顾重开后秒扫与省电 */
 
 /* 广播里的 0x181A Service Data（对应 ble.c:58-65 的 18 B 数组）：
  *   AD 长度字节 = 16（type 1 + UUID 2 + 13 B 载荷）

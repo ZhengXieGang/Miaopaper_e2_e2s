@@ -2262,6 +2262,76 @@ static void test_t17_display_gc_policy_and_interactive_defer(void)
 }
 
 /* ------------------------------------------------------------------ *
+ * T18：蓝牙关闭后重开（含连接态关闭/残留事件清理/启动失败状态回退）
+ * ------------------------------------------------------------------ */
+static void test_t18_ble_toggle_restart_and_error_rollback(void)
+{
+    sim_hal_init();
+    mp_app_boot();
+
+    CHECK_EQ_U(mp_settings.ble_enabled, 1u);
+    CHECK_EQ_U(mp_ble_running(), 1u);
+    CHECK(sim_hal_ble_adv_on());
+
+    /* 1) 在已连接状态下进入设置页手动关闭蓝牙，随后立刻重开：
+     *    旧断连残留不得误关重开后的协议栈，且必须恢复广播与 BLE 通信。 */
+    sim_hal_ble_connect(true, 247);
+    advance_ticks(200u, 100u);
+    CHECK_EQ_U(mp_ble_connected(), 1u);
+
+    press_click(KEY_PREV); /* CLOCK -> SETTINGS，默认选中第 0 项（蓝牙开关） */
+    CHECK_EQ_U(mp_app_state.screen, MP_SCREEN_SETTINGS);
+    CHECK_EQ_U(mp_app_state.set_sel, 0u);
+
+    uint32_t stops0 = sim_hal_ble_stop_calls();
+    uint32_t starts0 = sim_hal_ble_start_calls();
+
+    press_ok_single(); /* 蓝牙：开 -> 关 */
+    CHECK_EQ_U(mp_settings.ble_enabled, 0u);
+    CHECK_EQ_U(mp_ble_running(), 0u);
+    CHECK(!sim_hal_ble_adv_on());
+    CHECK_EQ_U(sim_hal_ble_stop_calls(), stops0 + 1u);
+
+    /* 模拟关蓝牙停栈期间可能产生的延迟断连通知后立即重开蓝牙。 */
+    press_ok_single(); /* 蓝牙：关 -> 开 */
+    CHECK_EQ_U(mp_settings.ble_enabled, 1u);
+    CHECK_EQ_U(mp_ble_running(), 1u);
+    CHECK(sim_hal_ble_adv_on());
+    CHECK_EQ_U(sim_hal_ble_start_calls(), starts0 + 1u);
+
+    /* 推进若干 tick 确认不会因残留标志误关蓝牙，且可重新建立连接并应答 0x19。 */
+    advance_ticks(3000u, 500u);
+    CHECK_EQ_U(mp_ble_running(), 1u);
+    CHECK(sim_hal_ble_adv_on());
+
+    sim_hal_ble_connect(true, 247);
+    sim_hal_ble_clear_tx();
+    ble_send(MP_OP_STATUS, NULL, 0);
+    CHECK(sim_hal_ble_tx_count() >= 1u);
+    CHECK_EQ_U(sim_hal_ble_tx_at(0)->data[0], MP_OP_STATUS);
+
+    /* 2) 再次关闭后，注入 mp_ble_start() 失败：设置必须回退为关，严禁假“开”。 */
+    press_ok_single(); /* 蓝牙：开 -> 关 */
+    CHECK_EQ_U(mp_settings.ble_enabled, 0u);
+    CHECK_EQ_U(mp_ble_running(), 0u);
+
+    sim_hal_ble_set_start_rc(-2);
+    press_ok_single(); /* 尝试开启但底层启动失败 */
+    CHECK_EQ_U(mp_settings.ble_enabled, 0u);
+    CHECK_EQ_U(mp_ble_running(), 0u);
+    CHECK(!sim_hal_ble_adv_on());
+
+    /* 恢复正常后再次开启，必须一次成功恢复广播。 */
+    sim_hal_ble_set_start_rc(0);
+    press_ok_single();
+    CHECK_EQ_U(mp_settings.ble_enabled, 1u);
+    CHECK_EQ_U(mp_ble_running(), 1u);
+    CHECK(sim_hal_ble_adv_on());
+
+    sim_hal_shutdown();
+}
+
+/* ------------------------------------------------------------------ *
  * 测试运行器（每项在独立 fork 子进程与独立临时目录中执行）
  * ------------------------------------------------------------------ */
 typedef struct {
@@ -2291,6 +2361,7 @@ static const fw_test_t k_tests[] = {
     { "T15",  "锁屏深睡插电唤醒 / RTC PAD HOLD 释放 / 掉电时间快照恢复", test_t15_deep_sleep_charge_hold_and_por_clock },
     { "T16",  "真实 power_filter 电量防抖 / 插拔 ±20% IR 补偿 / 快车道", test_t16_power_filter_debounce_and_ir_comp },
     { "T17",  "屏幕周期页内合并 GC / 微调页暂缓全刷 / 关闭空闲突袭",     test_t17_display_gc_policy_and_interactive_defer },
+    { "T18",  "蓝牙关闭重开 / 连接态关栈清残留 / 启动失败状态回退",      test_t18_ble_toggle_restart_and_error_rollback },
 };
 
 int main(int argc, char **argv)

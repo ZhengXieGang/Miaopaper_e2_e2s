@@ -28,6 +28,6 @@ idf_component_register(
     #           PORT_SPEC §7.1: never REQUIRES the reader "ble" component);
     #   fatfs — esp_vfs_fat_info("/sdcard") for mp_store_space();
     #   vfs   — VFS mount path used by mp_store.c (PORT_SPEC §6.5).
-    PRIV_REQUIRES bt fatfs vfs esp_driver_i2c esp_driver_gpio esp_hw_support esp_pm
+    PRIV_REQUIRES bt fatfs vfs esp_driver_i2c esp_driver_gpio esp_hw_support esp_pm esp_phy
                   app_update spi_flash bootloader_support esp_app_format mbedtls
                   esp_rom esp_system efuse esp_hal_wdt)

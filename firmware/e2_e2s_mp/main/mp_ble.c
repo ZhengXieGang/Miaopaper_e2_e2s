@@ -31,6 +31,13 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "sdkconfig.h"
+#ifdef CONFIG_PM_ENABLE
+#include "esp_pm.h"
+#endif
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "esp_phy_init.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -60,6 +67,16 @@
  * 数组，不碰 NVS（sdkconfig.defaults + e2s_reader/components/ble/reader_ble.c:48
  * 的同一写法；头文件在 IDF 的私有 include 路径里，所以前置声明）。 */
 void ble_store_config_init(void);
+
+#if CONFIG_IDF_TARGET_ESP32S3
+/* ESP-IDF v6.1.1 在 components/esp_phy/src/phy_init.c 的 esp_phy_modem_deinit()
+ * 中仅对 ESP32-C3 调用了 phy_init_flag()，漏掉了同为 SOC_PM_MODEM_RETENTION_BY_BACKUPDMA
+ * 且共用相同 phy_wakeup_init() 逻辑的 ESP32-S3：esp_bt_controller_deinit() 切断
+ * Modem 电源域后，RF 频率表硬件内存掉电丢失，二次开启时 phy_wakeup_init() 因
+ * phy_param[0x120] bit5 未清零而跳过 get_rf_freq_init()，导致 2.4 GHz 射频无输出。
+ * 该符号由 esp32s3/libphy.a 导出，这里在控制器完全反初始化后补调清位。 */
+extern void phy_init_flag(void);
+#endif
 
 static const char *TAG = "mp_ble";
 
@@ -98,6 +115,8 @@ _Static_assert(MP_BLE_ADV_SVC_PAYLOAD == 13,
                "0x181A Service Data 载荷固定 13 B（ble.c:58-65）");
 _Static_assert(MP_BLE_ADV_SVC_AD_LEN == 1 + 2 + MP_BLE_ADV_SVC_PAYLOAD,
                "AD 长度字节 = type(1) + UUID(2) + 载荷(13) = 16（ble.c:58-59）");
+_Static_assert(3u + (2u + MP_BLE_NAME_LEN) + (1u + MP_BLE_ADV_SVC_AD_LEN) <= 31u,
+               "主广播包（Flags + 完整设备名 + 0x181A Service Data）不得超过 31 字节");
 _Static_assert(sizeof(mp_ble_req_t) == 2u + MP_BLE_DATA_MAX,
                "收包队列条目必须是 op+len+data 的紧凑布局");
 
@@ -109,6 +128,19 @@ static bool s_started;
 static QueueHandle_t s_req_q;         /* host 任务 -> app 任务（mp_ble_req_t） */
 static SemaphoreHandle_t s_adv_mtx;   /* 串行化 广播 start/stop/set_data */
 static SemaphoreHandle_t s_host_exit_sem; /* 等待 NimBLE host 任务安全退出 */
+static SemaphoreHandle_t s_host_sync_sem; /* 等待 NimBLE host 完成同步与广播拉起 */
+
+#if CONFIG_IDF_TARGET_ESP32S3
+/* 首次启动成功后固定 84 B PHY 数字寄存器备份缓冲，防止控制器 deinit 销毁备份
+ *（不影响 esp_bt_power_domain_off() 彻底关闭 Modem 电源域）。 */
+static bool s_phy_retention_pinned;
+#endif
+
+#ifdef CONFIG_PM_ENABLE
+/* 蓝牙启停期间临时锁定 APB 高频并禁止自动轻睡，防止控制器/PHY 初始化中途降频。 */
+static esp_pm_lock_handle_t s_pm_apb_lock;
+static esp_pm_lock_handle_t s_pm_ls_lock;
+#endif
 
 /* GATT 值句柄（注册后由 NimBLE 填写） */
 static uint16_t s_h_main;   /* 0x331F */
@@ -172,6 +204,38 @@ static int gap_event(struct ble_gap_event *event, void *arg);
 /* ------------------------------------------------------------------ *
  * 小工具
  * ------------------------------------------------------------------ */
+static void ble_pm_lock_acquire(void)
+{
+#ifdef CONFIG_PM_ENABLE
+    if (s_pm_apb_lock == NULL) {
+        (void)esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "mp_ble_apb",
+                                 &s_pm_apb_lock);
+    }
+    if (s_pm_ls_lock == NULL) {
+        (void)esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "mp_ble_ls",
+                                 &s_pm_ls_lock);
+    }
+    if (s_pm_ls_lock != NULL) {
+        (void)esp_pm_lock_acquire(s_pm_ls_lock);
+    }
+    if (s_pm_apb_lock != NULL) {
+        (void)esp_pm_lock_acquire(s_pm_apb_lock);
+    }
+#endif
+}
+
+static void ble_pm_lock_release(void)
+{
+#ifdef CONFIG_PM_ENABLE
+    if (s_pm_apb_lock != NULL) {
+        (void)esp_pm_lock_release(s_pm_apb_lock);
+    }
+    if (s_pm_ls_lock != NULL) {
+        (void)esp_pm_lock_release(s_pm_ls_lock);
+    }
+#endif
+}
+
 static void log_limited(uint16_t *counter, const char *what, int rc)
 {
     (*counter)++;
@@ -203,9 +267,14 @@ static void adv_payload_build(void)
 /* 写广播数据 + 扫描响应名。调用者必须持有 s_adv_mtx。 */
 static int adv_set_fields(void)
 {
+    /* 主广播包直接携带 Flags(3 B) + 完整设备名 "MPP_E2S"(9 B) + 0x181A Service Data(17 B)
+     * = 29 B（≤31 B 上限），手机端即便被动扫描或漏收 Scan Response 也能一帧识别。 */
     struct ble_hs_adv_fields f;
     memset(&f, 0, sizeof f);
     f.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    f.name = (const uint8_t *)MP_BLE_NAME;
+    f.name_len = (uint8_t)MP_BLE_NAME_LEN;
+    f.name_is_complete = 1;
     f.svc_data_uuid16 = s_adv_svc_data;                /* UUID + 13 B 载荷 */
     f.svc_data_uuid16_len = (uint8_t)sizeof s_adv_svc_data;
     int rc = ble_gap_adv_set_fields(&f);
@@ -213,10 +282,7 @@ static int adv_set_fields(void)
         return rc;
     }
 
-    /* 名字放扫描响应，与 ble.c:265 的 bls_ll_setScanRspData 一致：adv 数据
-     * 只承载 flags(3 B) + 0x181A Service Data(17 B) = 20 B，扫描响应再放
-     * 9 B 的名字 AD。web 用 namePrefix:'MPP' 过滤，浏览器把 adv 与 scan rsp
-     * 合并后取名字，所以固定名 "MPP_E2S" 能被扫到（web:280-285）。 */
+    /* 扫描响应同样保留完整名，兼容仅解析 Scan Response 的主机与原版网页工具。 */
     struct ble_hs_adv_fields r;
     memset(&r, 0, sizeof r);
     r.name = (const uint8_t *)MP_BLE_NAME;
@@ -237,15 +303,18 @@ static void adv_apply(void)
     }
 
     bool want = s_started && s_adv_wanted && s_synced && !s_connected;
+    /* 以协议栈真实广播态为准，避免本地标志失步导致漏启或误判。 */
+    bool active = s_started && s_synced && (ble_gap_adv_active() != 0);
+    s_adv_on = active;
 
-    if (want && !s_adv_on) {
+    if (want && !active) {
         int rc = adv_set_fields();
         if (rc == 0) {
             struct ble_gap_adv_params p;
             memset(&p, 0, sizeof p);
             p.conn_mode = BLE_GAP_CONN_MODE_UND;
             p.disc_mode = BLE_GAP_DISC_MODE_GEN;
-            p.itvl_min = MP_BLE_ADV_ITVL; /* 1600 × 0.625 ms = 1.0 s */
+            p.itvl_min = MP_BLE_ADV_ITVL; /* 480 × 0.625 ms = 300 ms */
             p.itvl_max = MP_BLE_ADV_ITVL;
             rc = ble_gap_adv_start(s_addr_type, NULL, BLE_HS_FOREVER, &p,
                                    gap_event, NULL);
@@ -258,7 +327,7 @@ static void adv_apply(void)
         } else {
             ESP_LOGW(TAG, "adv data rc=%d", rc);
         }
-    } else if (!want && s_adv_on) {
+    } else if (!want && active) {
         int rc = ble_gap_adv_stop();
         s_adv_on = false;
         if (rc != 0 && rc != BLE_HS_EALREADY) {
@@ -282,8 +351,15 @@ static void adv_maybe_refresh(bool force)
     s_adv_counter++;
     adv_payload_build();
 
-    if (!s_adv_on || s_adv_mtx == NULL) {
-        return;                                  /* 下次 adv_apply 会重新写 */
+    if (s_adv_mtx == NULL) {
+        return;
+    }
+    if (!s_adv_on) {
+        /* 若本应广播但此前偶发启动失败，趁周期刷新自愈拉起。 */
+        if (s_started && s_adv_wanted && s_synced && !s_connected) {
+            adv_apply();
+        }
+        return;
     }
     if (xSemaphoreTake(s_adv_mtx, pdMS_TO_TICKS(200)) != pdPASS) {
         return;
@@ -817,6 +893,9 @@ static void on_host_sync(void)
     }
     s_synced = true;
     adv_apply();
+    if (s_host_sync_sem != NULL) {
+        xSemaphoreGive(s_host_sync_sem);
+    }
 }
 
 static void host_task(void *param)
@@ -846,6 +925,8 @@ int mp_ble_start(void)
     s_adv_on = false;
     s_conn = BLE_HS_CONN_HANDLE_NONE;
     s_upload = 0;
+    s_adv_data_ms = 0;
+    s_param_req_ms = 0;
     adv_payload_build();
 
     if (s_req_q == NULL) {
@@ -857,17 +938,36 @@ int mp_ble_start(void)
     if (s_host_exit_sem == NULL) {
         s_host_exit_sem = xSemaphoreCreateBinary();
     }
-    if (s_req_q == NULL || s_adv_mtx == NULL || s_host_exit_sem == NULL) {
+    if (s_host_sync_sem == NULL) {
+        s_host_sync_sem = xSemaphoreCreateBinary();
+    }
+    if (s_req_q == NULL || s_adv_mtx == NULL ||
+        s_host_exit_sem == NULL || s_host_sync_sem == NULL) {
         ESP_LOGE(TAG, "no memory for BLE queue/mutex");
         return -1;
     }
     (void)xSemaphoreTake(s_host_exit_sem, 0);
+    (void)xSemaphoreTake(s_host_sync_sem, 0);
+
+    /* 锁定 APB 高频并暂禁自动轻睡，覆盖整个控制器/PHY 唤醒与 Host 同步过程。 */
+    ble_pm_lock_acquire();
 
     esp_err_t e = nimble_port_init();
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "nimble_port_init: %s", esp_err_to_name(e));
+        ble_pm_lock_release();
         return -2;
     }
+
+#if CONFIG_IDF_TARGET_ESP32S3
+    /* 固定 84 B PHY 数字寄存器备份缓冲区：后续 mp_ble_stop() 关 Modem 电源域时
+     * 不会释放备份，二次重启蓝牙时 esp_phy_enable() 既重跑 get_rf_freq_init()
+     * 又完整恢复 21 个 PHY 数字寄存器；不阻碍 Modem 电源域彻底断电省电。 */
+    if (!s_phy_retention_pinned) {
+        esp_phy_modem_init(0);
+        s_phy_retention_pinned = true;
+    }
+#endif
 
     ble_hs_cfg.reset_cb = on_host_reset;
     ble_hs_cfg.sync_cb = on_host_sync;
@@ -880,6 +980,10 @@ int mp_ble_start(void)
 
     if (gatt_register() != 0) {
         (void)nimble_port_deinit();
+#if CONFIG_IDF_TARGET_ESP32S3
+        phy_init_flag();
+#endif
+        ble_pm_lock_release();
         return -3;
     }
 
@@ -899,7 +1003,17 @@ int mp_ble_start(void)
     s_started = true;
     nimble_port_freertos_init(host_task);
 
-    ESP_LOGI(TAG, "ready: %s, adv %s", MP_BLE_NAME, s_adv_wanted ? "on" : "off");
+    /* 等待 NimBLE host 同步并落实广播，避免返回前切频/轻睡打断 HCI 启动序列。 */
+    if (xSemaphoreTake(s_host_sync_sem, pdMS_TO_TICKS(1500)) != pdPASS) {
+        ESP_LOGW(TAG, "host sync wait timeout");
+    } else if (s_adv_wanted && !s_adv_on) {
+        adv_apply();
+    }
+
+    ble_pm_lock_release();
+
+    ESP_LOGI(TAG, "ready: %s, synced=%d, adv %s",
+             MP_BLE_NAME, s_synced ? 1 : 0, s_adv_on ? "on" : "off");
     return 0;
 }
 
@@ -908,6 +1022,9 @@ void mp_ble_stop(void)
     if (!s_started) {
         return;
     }
+
+    /* 反初始化全程保持稳频且禁轻睡，防止控制器禁用后收尾被打断。 */
+    ble_pm_lock_acquire();
 
     s_adv_wanted = false;
     adv_apply();
@@ -930,12 +1047,21 @@ void mp_ble_stop(void)
         ESP_LOGW(TAG, "nimble_port_deinit: %s", esp_err_to_name(de));
     }
 
+#if CONFIG_IDF_TARGET_ESP32S3
+    /* 控制器反初始化已切断 Modem 电源域，补清 PHY 频率表就绪标志，确保下次
+     * 重新打开蓝牙时 phy_wakeup_init() 重跑 get_rf_freq_init() 重建射频频点表。 */
+    phy_init_flag();
+#endif
+
     s_started = false;
     s_synced = false;
     s_connected = false;
     s_adv_on = false;
     s_conn = BLE_HS_CONN_HANDLE_NONE;
     s_upload = 0;
+    s_adv_data_ms = 0;
+    s_param_req_ms = 0;
+    s_notify_errs = 0;
     s_batt_sub = 0;
     s_temp_sub = 0;
     s_batt_notified = -1;
@@ -949,6 +1075,11 @@ void mp_ble_stop(void)
     if (s_req_q != NULL) {
         xQueueReset(s_req_q);
     }
+    if (s_host_sync_sem != NULL) {
+        (void)xSemaphoreTake(s_host_sync_sem, 0);
+    }
+
+    ble_pm_lock_release();
     ESP_LOGI(TAG, "ble stack stopped (radio off)");
 }
 

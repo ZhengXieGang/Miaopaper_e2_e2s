@@ -312,6 +312,9 @@ static void (*s_input_wake_cb)(void);
 static bool s_ble_running;
 static bool s_ble_adv;
 static bool s_ble_connected;
+static int s_ble_start_rc;
+static uint32_t s_ble_start_calls;
+static uint32_t s_ble_stop_calls;
 static uint16_t s_ble_mtu;
 static uint8_t s_ble_upload;
 static void (*s_ble_time_cb)(const mp_time_t *t);
@@ -487,6 +490,9 @@ void sim_hal_init(void)
     s_ble_running = true;
     s_ble_adv = true;
     s_ble_connected = false;
+    s_ble_start_rc = 0;
+    s_ble_start_calls = 0;
+    s_ble_stop_calls = 0;
     s_ble_mtu = 247;
     s_ble_upload = 0;
     s_ble_time_cb = NULL;
@@ -1282,11 +1288,25 @@ const sim_ble_pkt_t *sim_hal_ble_tx_at(size_t idx)
 }
 
 bool sim_hal_ble_adv_on(void) { return s_ble_adv; }
+void sim_hal_ble_set_start_rc(int rc) { s_ble_start_rc = rc; }
+uint32_t sim_hal_ble_start_calls(void) { return s_ble_start_calls; }
+uint32_t sim_hal_ble_stop_calls(void) { return s_ble_stop_calls; }
 
-int mp_ble_start(void) { s_ble_running = true; return 0; }
+int mp_ble_start(void)
+{
+    s_ble_start_calls++;
+    if (s_ble_start_rc != 0) {
+        s_ble_running = false;
+        s_ble_adv = false;
+        return s_ble_start_rc;
+    }
+    s_ble_running = true;
+    return 0;
+}
 
 void mp_ble_stop(void)
 {
+    s_ble_stop_calls++;
     s_ble_running = false;
     s_ble_adv = false;
     s_ble_connected = false;

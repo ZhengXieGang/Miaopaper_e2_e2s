@@ -141,6 +141,9 @@ void sim_hal_ble_clear_tx(void);
 size_t sim_hal_ble_tx_count(void);
 const sim_ble_pkt_t *sim_hal_ble_tx_at(size_t idx);
 bool sim_hal_ble_adv_on(void);
+void sim_hal_ble_set_start_rc(int rc);
+uint32_t sim_hal_ble_start_calls(void);
+uint32_t sim_hal_ble_stop_calls(void);
 
 /* ---- Flash / 分区 / 镜像 / 安全红线 --------------------------------- */
 uint8_t *sim_hal_flash_raw(void);

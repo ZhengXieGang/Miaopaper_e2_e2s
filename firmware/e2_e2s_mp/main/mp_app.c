@@ -2452,12 +2452,24 @@ static void settings_activate(void)
         if (mp_settings.ble_enabled) {
             mp_settings.ble_enabled = 0;
             mp_ble_stop();
+            /* 停栈后清掉残留连接事件，避免重开蓝牙后被旧断连标志干扰。 */
+            s_conn_lost = 0;
+            s_conn_up = 0;
+            s_status_pending = 0;
             mp_app_state.ble_off_ms = now_ms();
         } else {
             mp_settings.ble_enabled = 1;
             ble_touch(now_ms());
-            (void)mp_ble_start();
-            mp_ble_adv(1);
+            if (mp_ble_start() == 0) {
+                mp_ble_adv(1);
+                const power_status_t *p = pw();
+                if (p->valid) {
+                    mp_ble_publish_battery(p->percent, p->mv);
+                }
+            } else {
+                ESP_LOGE(TAG, "mp_ble_start failed; revert ble_enabled=0");
+                mp_settings.ble_enabled = 0;
+            }
         }
         (void)mp_settings_save();
         page_commit();
@@ -3726,7 +3738,11 @@ static void ble_settings_write(const mp_ble_req_t *req)
     mp_settings.sleep_timeout_idx = idx;
     if (ble) {
         ble_touch(now_ms());
-        (void)mp_ble_start();
+        if (mp_ble_start() != 0) {
+            ESP_LOGE(TAG, "ble_settings_write: mp_ble_start failed");
+            mp_settings.ble_enabled = 0;
+            ble = 0;
+        }
     }
     mp_ble_adv(ble);
     int rc = mp_settings_save();
@@ -4331,6 +4347,9 @@ static void ble_auto_disable(uint32_t now, const char *reason)
 {
     mp_settings.ble_enabled = 0;
     mp_ble_stop();
+    s_conn_lost = 0;
+    s_conn_up = 0;
+    s_status_pending = 0;
     (void)mp_settings_save();
     mp_app_state.ble_off_ms = now ? now : 1u;
     ESP_LOGI(TAG, "ble auto off: %s", reason);
