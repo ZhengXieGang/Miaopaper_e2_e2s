@@ -23,6 +23,7 @@ MAIN    := $(ROOT)/main
 BUILD   := $(SIM_DIR)/build
 BIN     := $(BUILD)/sim_mp
 FW_BIN  := $(BUILD)/sim_fw_regress
+EPD_BIN := $(BUILD)/sim_epd_regress
 
 # 固件全链路回归测试默认开启 ASan + UBSan；可通过 SANITIZE=0 关闭。
 SANITIZE ?= 1
@@ -137,7 +138,7 @@ CONFIG_STAMP := $(BUILD)/config.stamp
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean print-config regress fw-regress FORCE
+.PHONY: all clean print-config regress fw-regress epd-regress FORCE
 
 $(CONFIG_STAMP): FORCE
 	@mkdir -p $(BUILD)
@@ -200,10 +201,34 @@ $(FW_BIN): $(FW_SRCS) $(FW_HEADERS) $(MAKEFILE_LIST)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(FW_SAN_FLAGS) $(FW_CPPFLAGS) $(FW_SRCS) -o $@
 
-fw-regress: $(FW_BIN)
+# --------------------------------------------------------------------------
+# EPD 驱动协议回归测试（直接编译真实 components/e2s_epd/epd.c + SPI/GPIO 桩）
+# --------------------------------------------------------------------------
+EPD_SRCS := $(SIM_DIR)/sim_epd_regress.c \
+            $(COMPONENTS)/e2s_epd/epd.c
 
-regress: $(FW_BIN)
+EPD_CPPFLAGS := -I$(SIM_DIR)/host_inc \
+                -I$(COMPONENTS)/e2s_epd \
+                -I$(COMPONENTS)/common/include \
+                -D_GNU_SOURCE -include stdbool.h
+
+EPD_HEADERS := $(COMPONENTS)/e2s_epd/epd.h \
+               $(COMPONENTS)/e2s_epd/epd_lut_stock.h \
+               $(SIM_DIR)/host_inc/driver/spi_master.h \
+               $(SIM_DIR)/host_inc/driver/gpio.h \
+               $(SIM_DIR)/host_inc/esp_timer.h
+
+$(EPD_BIN): $(EPD_SRCS) $(EPD_HEADERS) $(MAKEFILE_LIST)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(FW_SAN_FLAGS) $(EPD_CPPFLAGS) $(EPD_SRCS) -o $@
+
+epd-regress: $(EPD_BIN)
+
+fw-regress: $(FW_BIN) $(EPD_BIN)
+
+regress: $(FW_BIN) $(EPD_BIN)
 	@$(FW_BIN)
+	@$(EPD_BIN)
 
 print-config:
 	@echo "sim_dir      $(SIM_DIR)"

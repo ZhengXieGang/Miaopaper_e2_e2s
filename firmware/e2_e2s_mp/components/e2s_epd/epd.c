@@ -26,16 +26,18 @@
  *     - 47==1 -> 读 0x70 5B; id[2]==5 -> OED(type 3), 否则 GD(type 0, 原厂不刷新)
  *
  *   两套刷新路径:
- *     BOE(0x42029ed4): 0x12 -> 0x01 FA0000 -> 0x11 03 -> 0x21 0080 -> 0x18 80
+ *     BOE/GD(0x42029ed4): 0x12 -> 0x01 FA0000 -> 0x11 03 -> 0x21 0080 -> 0x18 80
  *          -> 0x3C 05 -> 0x3F 22 -> 0x03 17 -> 0x04 41A832 -> 0x2C 58
  *          -> 0x32 153B LUT -> 窗口 -> 0x24/0x26 帧 -> 0x22 C7 -> 0x20
  *     OED(0x4202a424 "OED is all"): 复位 -> 等 47==1 -> 0x00 FF89/01/03/06/30/60
- *          /82/E3/61/65/50 -> 0x20/24/22/23 各 55B LUT -> 等 47==1
- *          -> 0x13 帧 -> 等 47==1 -> 0x17 A5 -> 等 47==0 -> 0x41 07
+ *          /82/E3/41/61/65/50/50 -> 0x20/21/24/22/23 各 56B LUT(含首字节 0x01)
+ *          -> 等 47==1 -> 仅 0x13 帧(4000B) -> 等 47==1 -> 0x17 A5
+ *          -> 等 47==0 -> 0x41 07 -> 等 47==1 完成 -> 0x41 07
  *
  * BOE 实测 BUSY 高=忙/低=空闲,用严格空闲等待(连续 10 ms 低,期间变高就
- * 重置重等)并记录 ev= 轨迹;OED 分支仍沿用原厂 wait_level(1)/wait_reaction
- * 的反应式等待,其极性假设需 OED 实机确认。
+ * 重置重等)并记录 ev= 轨迹;OED (JD79653) 依据原厂 E2 1.3.759 / E2S 1.3.739
+ * 反汇编为 BUSY_N 低=忙/高=空闲,发 0x17 A5 后先等变低确认进入刷新,再等连续
+ * 10 ms 回高确认刷新完成(未见到低电平则按原厂 800 ms 保护窗兜底)。
  */
 #include "epd.h"
 #include "epd_lut_stock.h"
@@ -135,18 +137,31 @@ static esp_err_t wcmd(uint8_t c) { return epd_send(&c, 1, 0); }
 
 static esp_err_t wdata(const void *d, int len) { return epd_send((const uint8_t *)d, len, 1); }
 
+/* 单字节数据写（对齐原厂 epd_spi_write_data，每字节独立拉一次 CS）。 */
+static esp_err_t wdata_byte(uint8_t b) { return epd_send(&b, 1, 1); }
+
+/* 逐字节发送控制寄存器参数或波形表（100% 复刻原厂 OED 总线波形）。 */
+static esp_err_t wdata_each(const uint8_t *d, int len)
+{
+    for (int i = 0; i < len; i++) {
+        esp_err_t err = epd_send(&d[i], 1, 1);
+        if (err != ESP_OK)
+            return err;
+    }
+    return ESP_OK;
+}
+
 /* 等 BUSY 到达指定电平, 记录起始/结束电平与耗时。
- * 本函数显式依赖电平极性:只有 OED 分支用它等 "1=就绪"(沿用原厂序列),
- * 该假设尚无真机证据;超时只告警并继续,不当作刷新失败。BOE/局刷走下面的
- * 严格空闲等待,不假设极性。 */
+ * OED (JD79653) 路径依据原厂 E2 1.3.759 / E2S 1.3.739 反汇编为 0=忙、1=空闲;
+ * 超时只告警并继续,不当作刷新失败。 */
 static int wait_level(int level, int timeout_ms, const char *tag)
 {
     int start = gpio_get_level(EPD_PIN_BUSY);
     int64_t t0 = esp_timer_get_time();
     int t = 0;
     while (gpio_get_level(EPD_PIN_BUSY) != level && t < timeout_ms) {
-        vTaskDelay(pdMS_TO_TICKS(5));
-        t += 5;
+        vTaskDelay(pdMS_TO_TICKS(1));
+        t++;
     }
     uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
     int end = gpio_get_level(EPD_PIN_BUSY);
@@ -157,31 +172,38 @@ static int wait_level(int level, int timeout_ms, const char *tag)
     return end == level ? 0 : -1;
 }
 
-/* 反应式等待: 等 BUSY 翻转再回到起始电平; 面板完全没反应则超时。
- * 超时不算错误。 */
-static int wait_reaction(int timeout_ms, const char *tag)
+/* OED 严格空闲等待（BUSY_N 低=忙、高=空闲）：
+ * 连续 10 ms 为高电平才认为刷新与自动断电彻底结束，期间变低即重置计数。 */
+static int wait_oed_idle_ms(int timeout_ms, const char *tag, int *saw_busy, int *timed_out)
 {
-    int base = gpio_get_level(EPD_PIN_BUSY);
+    int start = gpio_get_level(EPD_PIN_BUSY);
     int64_t t0 = esp_timer_get_time();
-    int t = 0, changed = 0;
+    int t = 0, stable = 0, busy_seen = (start == 0) ? 1 : 0;
+    if (timed_out)
+        *timed_out = 0;
+
     while (t < timeout_ms) {
-        if (gpio_get_level(EPD_PIN_BUSY) != base) { changed = 1; break; }
-        vTaskDelay(pdMS_TO_TICKS(5));
-        t += 5;
-    }
-    if (changed) {
-        while (t < timeout_ms) {
-            if (gpio_get_level(EPD_PIN_BUSY) == base) break;
-            vTaskDelay(pdMS_TO_TICKS(5));
-            t += 5;
+        int lv = gpio_get_level(EPD_PIN_BUSY);
+        if (lv == 0) {
+            busy_seen = 1;
+            stable = 0;
+        } else if (++stable >= 10) {
+            break;
         }
+        vTaskDelay(pdMS_TO_TICKS(1));
+        t++;
+    }
+    if (stable < 10) {
+        if (timed_out)
+            *timed_out = 1;
+        ESP_LOGW(TAG, "%s OED BUSY still low after %d ms", tag, t);
     }
     uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
     int end = gpio_get_level(EPD_PIN_BUSY);
-    ev_add(tag, base, end, changed, ms);
-    ESP_LOGI(TAG, "%s busy %d->%d %s %ums", tag, base, end, changed ? "reacted" : "no reaction",
-             (unsigned)ms);
-    return changed ? 0 : -1;
+    ev_add(tag, start, end, busy_seen, ms);
+    if (saw_busy)
+        *saw_busy = busy_seen;
+    return (int)ms;
 }
 
 /* 严格空闲等待(真机实测: BUSY 高=忙、低=空闲)。
@@ -222,17 +244,17 @@ static int wait_idle_ms(int timeout_ms, const char *tag, int *saw_busy, int *tim
     return (int)ms;
 }
 
-/* 原厂 0x420298c8: RST 低 11 tick -> 高 11 tick; 这里放宽到 120ms。 */
-static void hw_reset(void)
+/* 原厂 0x420298c8: RST 低 11 tick -> 高 11 tick；可按场景传入脉冲宽度。 */
+static void hw_reset_ms(int ms)
 {
     gpio_set_level(EPD_PIN_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(120));
+    vTaskDelay(pdMS_TO_TICKS(ms));
     gpio_set_level(EPD_PIN_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(120));
+    vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
 /* 0x70 + 5 字节 ID; 原厂读事务 length=0, rxlength=40。
- * 读事务同样计入本轮错误(SPI 错误必须传播)。 */
+ * 仅用于 epd_init() 面板识别诊断日志，不污染刷新期 s_draw_err。 */
 static void panel_read_id(uint8_t *buf)
 {
     uint8_t cmd = 0x70;
@@ -253,34 +275,7 @@ static void panel_read_id(uint8_t *buf)
     esp_err_t e2 = spi_device_polling_transmit(s_spi, &r);
     gpio_set_level(EPD_PIN_CS, 1);
     s_rd_err = (e1 != ESP_OK) ? e1 : (e2 != ESP_OK ? e2 : 0);
-    err_record(e1);
-    err_record(e2);
     ESP_LOGI(TAG, "epd id %02x %02x %02x %02x %02x", buf[0], buf[1], buf[2], buf[3], buf[4]);
-}
-
-static void panel_read_temp(void)
-{
-    uint8_t cmd = 0x40, t[2] = { 0, 0 };
-    gpio_set_level(EPD_PIN_DC, 0);
-    gpio_set_level(EPD_PIN_CS, 0);
-    spi_transaction_t c = { 0 };
-    c.length = 8;
-    c.tx_buffer = &cmd;
-    c.user = (void *)(intptr_t)2;
-    esp_err_t e1 = spi_device_polling_transmit(s_spi, &c);
-    gpio_set_level(EPD_PIN_DC, 1);
-    spi_transaction_t r = { 0 };
-    r.length = 0;
-    r.rxlength = 2 * 8;
-    r.rx_buffer = t;
-    r.user = (void *)(intptr_t)2;
-    esp_err_t e2 = spi_device_polling_transmit(s_spi, &r);
-    gpio_set_level(EPD_PIN_CS, 1);
-    s_rd_err = (e1 != ESP_OK) ? e1 : (e2 != ESP_OK ? e2 : 0);
-    err_record(e1);
-    err_record(e2);
-    s_temp = (t[0] << 8) | t[1];
-    ESP_LOGI(TAG, "epd temp %02x %02x", t[0], t[1]);
 }
 
 /* 1bpp 帧 -> 面板 RAM 字节序 (每行 16B)。实机 r25 显示上下翻转,
@@ -317,15 +312,23 @@ static int set_full_window(void)
     return 0;
 }
 
-static int write_lut55(uint8_t cmd, const uint8_t *lut)
+/* 按原厂 OED (JD79653) 序列逐字节写入完整 56 字节波形表（含首字节 0x01）。 */
+static int write_lut56(uint8_t cmd, const uint8_t lut[56])
 {
     EPD_CHECK(wcmd(cmd));
-    EPD_CHECK(wdata(lut, 55));
+    EPD_CHECK(wdata_each(lut, 56));
     return 0;
 }
 
-/* OED "OED is all" (0x4202a424): 复位 + UC8151 风格初始化 + 0x13 帧 + 0x17 A5。
- * 返回 0 成功;非 0 为累计的 SPI 错误。 */
+/* OED "OED is all"（严格对齐原厂 E2 1.3.759 @0x42024368 / E2S 1.3.739 @0x4202a424）：
+ *   1) 硬件复位 + 等 BUSY_N==1 空闲；
+ *   2) 逐字节写 JD79653 全套初始化寄存器（0x00/01/03/06/30/60/82/E3/41/61/65/50/50）；
+ *   3) 按原厂顺序写入 5 张 56 字节全刷 LUT（0x20/0x21/0x24/0x22/0x23）；
+ *   4) 等 BUSY_N==1 -> 仅向 0x13 (DTM2) 连续写入 4000 字节帧缓冲 -> 等 BUSY_N==1；
+ *   5) 发 0x17 0xA5 触发自动升压刷新断电序列 -> 等 BUSY_N==0 确认开始刷新 -> 发 0x41 0x07
+ *      -> 等 BUSY_N 连续 10 ms 回高确认刷新完成（若未见到低电平则按原厂 800 ms 兜底）
+ *      -> 补发 0x41 0x07（对齐原厂 sm_sleep @0x42029d34）。
+ * 返回 0 成功；非 0 为累计的 SPI 错误。 */
 static int oed_full_refresh(const uint8_t *fb)
 {
     static const uint8_t p00[] = { 0xff, 0x89 };
@@ -334,51 +337,56 @@ static int oed_full_refresh(const uint8_t *fb)
     static const uint8_t p61[] = { 0x80, 0x00, 0xfa };
     static const uint8_t p65[] = { 0x00, 0x00, 0x00 };
     const int n = EPD_W * ((EPD_H + 7) / 8);
-    uint8_t d;
 
-    hw_reset();
-    wait_level(1, 2500, "o0");       /* 原厂: 复位后等 47==1 */
+    hw_reset_ms(20);
+    wait_level(1, 2500, "o0");       /* 原厂 0x4202a448: 复位后等 47==1 */
 
-    EPD_CHECK(wcmd(0x00)); EPD_CHECK(wdata(p00, (int)sizeof(p00)));
-    EPD_CHECK(wcmd(0x01)); EPD_CHECK(wdata(p01, (int)sizeof(p01)));
-    EPD_CHECK(wcmd(0x03)); d = 0x00; EPD_CHECK(wdata(&d, 1));
-    EPD_CHECK(wcmd(0x06)); EPD_CHECK(wdata(p06, (int)sizeof(p06)));
-    EPD_CHECK(wcmd(0x30)); d = 0x09; EPD_CHECK(wdata(&d, 1));
-    EPD_CHECK(wcmd(0x60)); d = 0x22; EPD_CHECK(wdata(&d, 1));
-    EPD_CHECK(wcmd(0x82)); d = 0x00; EPD_CHECK(wdata(&d, 1));
-    EPD_CHECK(wcmd(0xe3)); d = 0x00; EPD_CHECK(wdata(&d, 1));
-    EPD_CHECK(wcmd(0x41)); d = 0x00; EPD_CHECK(wdata(&d, 1));
-    EPD_CHECK(wcmd(0x61)); EPD_CHECK(wdata(p61, (int)sizeof(p61)));
-    EPD_CHECK(wcmd(0x65)); EPD_CHECK(wdata(p65, (int)sizeof(p65)));
-    EPD_CHECK(wcmd(0x50)); d = 0xb7; EPD_CHECK(wdata(&d, 1));
-    EPD_CHECK(wcmd(0x50)); d = 0xb7; EPD_CHECK(wdata(&d, 1));
-    EPD_CHECK(write_lut55(0x20, s_lut20));
-    EPD_CHECK(write_lut55(0x24, s_lut24));
-    EPD_CHECK(write_lut55(0x22, s_lut22));
-    EPD_CHECK(write_lut55(0x23, s_lut23));
+    EPD_CHECK(wcmd(0x00)); EPD_CHECK(wdata_each(p00, (int)sizeof(p00)));
+    EPD_CHECK(wcmd(0x01)); EPD_CHECK(wdata_each(p01, (int)sizeof(p01)));
+    EPD_CHECK(wcmd(0x03)); EPD_CHECK(wdata_byte(0x00));
+    EPD_CHECK(wcmd(0x06)); EPD_CHECK(wdata_each(p06, (int)sizeof(p06)));
+    EPD_CHECK(wcmd(0x30)); EPD_CHECK(wdata_byte(0x09));
+    EPD_CHECK(wcmd(0x60)); EPD_CHECK(wdata_byte(0x22));
+    EPD_CHECK(wcmd(0x82)); EPD_CHECK(wdata_byte(0x00));
+    EPD_CHECK(wcmd(0xe3)); EPD_CHECK(wdata_byte(0x00));
+    EPD_CHECK(wcmd(0x41)); EPD_CHECK(wdata_byte(0x00));
+    EPD_CHECK(wcmd(0x61)); EPD_CHECK(wdata_each(p61, (int)sizeof(p61)));
+    EPD_CHECK(wcmd(0x65)); EPD_CHECK(wdata_each(p65, (int)sizeof(p65)));
+    EPD_CHECK(wcmd(0x50)); EPD_CHECK(wdata_byte(0xb7));
+    EPD_CHECK(wcmd(0x50)); EPD_CHECK(wdata_byte(0xb7));
+    EPD_CHECK(write_lut56(0x20, s_oed_full_lut20));
+    EPD_CHECK(write_lut56(0x21, s_oed_full_lut21));
+    EPD_CHECK(write_lut56(0x24, s_oed_full_lut24));
+    EPD_CHECK(write_lut56(0x22, s_oed_full_lut22));
+    EPD_CHECK(write_lut56(0x23, s_oed_full_lut23));
     s_stage = 3;
 
+    /* 原厂 0x4202a5b0..0x4202a5b9：仅写 0x13 (DTM2) 4000 字节，不发 SSD1680 窗口与 0x10。 */
     wait_level(1, 2500, "o1");
-    EPD_CHECK(set_full_window());
-    /* UC8151: 0x10=DTM1(old), 0x13=DTM2(new)。两个 bank 都写本帧, 避免未初始化
-     * 的 old-bank 让全刷驱动成全黑。 */
-    EPD_CHECK(wcmd(0x10));
-    EPD_CHECK(wdata(fb, n));
     EPD_CHECK(wcmd(0x13));
     EPD_CHECK(wdata(fb, n));
-    s_written += (uint32_t)n * 2;
+    s_written += (uint32_t)n;
     wait_level(1, 2500, "o2");
 
-    EPD_CHECK(wcmd(0x17)); d = 0xa5; EPD_CHECK(wdata(&d, 1));
+    /* 原厂 epd_hal_reflash_oed_213 (0x42029ac8)：发送 0x17 0xA5 自动刷新。 */
+    EPD_CHECK(wcmd(0x17)); EPD_CHECK(wdata_byte(0xa5));
     s_stage = 4;
-    wait_reaction(20000, "o3");      /* 原厂: 等 47==0 */
 
-    EPD_CHECK(wcmd(0x41)); d = 0x07; EPD_CHECK(wdata(&d, 1));
+    /* 先确认 BUSY_N 拉低（0=忙），发 0x41 0x07 后等 BUSY_N 连续 10 ms 回高完成刷新。 */
+    int started = (wait_level(0, 500, "o3") == 0);
+    EPD_CHECK(wcmd(0x41)); EPD_CHECK(wdata_byte(0x07));
     s_stage = 5;
-    panel_read_temp();
+
+    int saw_busy = started;
+    int timed_out = 0;
+    wait_oed_idle_ms(5000, "o4", &saw_busy, &timed_out);
+    if (!started && !saw_busy) {
+        /* 面板未观测到忙电平（如忙脉冲极短或异常）：按原厂 800 ms 刷新保护窗兜底。 */
+        ESP_LOGW(TAG, "o4: no BUSY low observed; fallback settle 800ms");
+        vTaskDelay(pdMS_TO_TICKS(800));
+    }
+    EPD_CHECK(wcmd(0x41)); EPD_CHECK(wdata_byte(0x07));
     s_stage = 6;
-    panel_read_id(s_id2);
-    s_stage = 7;
     return s_draw_err;
 }
 
@@ -504,12 +512,12 @@ int epd_init(void)
     }
 
     /* 原厂 discern: 复位 -> 等 ~100ms -> 读 47 分族。 */
-    hw_reset();
+    hw_reset_ms(120);
     s_stage = 1;
     vTaskDelay(pdMS_TO_TICKS(100));
     s_pad47 = gpio_get_level(EPD_PIN_BUSY);
     if (s_pad47 == 0) {
-        s_family = 1; /* BOE, 原厂不读 ID */
+        s_family = 1; /* BOE/GD (SSD1680), 原厂不读 ID */
     } else {
         panel_read_id(s_id);
         /* 读事务本身可能受 3 线半双工限制而不可靠; 47==1 时按 OED 处理。 */
@@ -593,11 +601,15 @@ void epd_deep_sleep(void)
         esp_err_t e2 = wdata(&d, 1);
         ESP_LOGI(TAG, "epd deep sleep BOE err=%d/%d", (int)e1, (int)e2);
     } else if (s_family == 3) {
-        /* OED (UC8151): 发 0x07 0xA5 进深睡并保持画面。 */
-        uint8_t d = 0xa5;
+        /* OED (JD79653)：对齐原厂 sm_sleep(0x42029d31) + deep_sleep(0x4202ac0a)，
+         * 先等 BUSY_N==1 空闲，写 0x41 0x07 再发 0x07 0xA5 进深睡并保持画面。 */
+        wait_level(1, 1500, "oslp");
+        esp_err_t e0 = wcmd(0x41);
+        esp_err_t e0d = wdata_byte(0x07);
         esp_err_t e1 = wcmd(0x07);
-        esp_err_t e2 = wdata(&d, 1);
-        ESP_LOGI(TAG, "epd deep sleep OED err=%d/%d", (int)e1, (int)e2);
+        esp_err_t e2 = wdata_byte(0xa5);
+        ESP_LOGI(TAG, "epd deep sleep OED err=%d/%d/%d/%d",
+                 (int)e0, (int)e0d, (int)e1, (int)e2);
     }
     vTaskDelay(pdMS_TO_TICKS(20));
 

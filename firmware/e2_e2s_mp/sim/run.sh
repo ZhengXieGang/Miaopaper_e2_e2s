@@ -117,6 +117,7 @@ done
 
 BIN="$SIM_DIR/build/sim_mp"
 FW_BIN="$SIM_DIR/build/sim_fw_regress"
+EPD_BIN="$SIM_DIR/build/sim_epd_regress"
 
 if [ "$MODE" = regress ]; then
     if [ "$NO_BUILD" -eq 0 ]; then
@@ -128,7 +129,8 @@ if [ "$MODE" = regress ]; then
     if [ -n "$ONLY" ]; then
         exec "$FW_BIN" --only "$ONLY"
     else
-        exec "$FW_BIN"
+        "$FW_BIN"
+        exec "$EPD_BIN"
     fi
 fi
 
@@ -152,6 +154,9 @@ if [ "$MODE" = check ]; then
         fi
         if [ -x "$FW_BIN" ]; then
             "$FW_BIN"
+        fi
+        if [ -x "$EPD_BIN" ]; then
+            "$EPD_BIN"
         fi
     fi
     exit 0
